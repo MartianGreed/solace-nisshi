@@ -32,7 +32,6 @@ use deadpool_postgres::{
     Transaction,
 };
 use futures::pin_mut;
-use futures_util::future;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
     ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
@@ -72,10 +71,10 @@ use opentelemetry::{KeyValue, metrics::Counter};
 use rand::{prelude::*, rng};
 use serde_json::Value;
 use tokio_postgres::{
-    Config, Row, RowStream,
+    Config, Row,
     binary_copy::BinaryCopyInWriter,
     error::SqlState,
-    types::{BorrowToSql, ToSql, Type},
+    types::{ToSql, Type},
 };
 use tracing::{debug, error, instrument};
 use url::Url;
@@ -802,28 +801,6 @@ impl Postgres {
                 SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
             })
             .map_err(Into::into)
-    }
-
-    #[instrument(skip(self, tx, params))]
-    async fn tx_prepare_query_raw<P, I>(
-        &self,
-        tx: &Transaction<'_>,
-        sql: &str,
-        params: I,
-    ) -> Result<RowStream, Error>
-    where
-        P: BorrowToSql,
-        I: IntoIterator<Item = P>,
-        I::IntoIter: ExactSizeIterator,
-    {
-        let sql = self.sql_lookup(sql)?;
-
-        let prepared = tx
-            .prepare_cached(sql)
-            .await
-            .inspect_err(|err| error!(?err))?;
-
-        tx.query_raw(&prepared, params).await.map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -1923,30 +1900,25 @@ impl Storage for Postgres {
 
         debug!(?topic_uuid, cluster = self.cluster, ?topic);
 
-        _ = future::try_join_all(
-            (0..topic.num_partitions)
-                .map(|partition| {
-                    let cluster = Box::new(self.cluster.clone()) as Box<dyn ToSql + Sync + Send>;
-                    let name = Box::new(topic.name.clone()) as Box<dyn ToSql + Sync + Send>;
-                    let partition = Box::new(partition) as Box<dyn ToSql + Sync + Send>;
-                    [cluster, name, partition]
-                })
-                .map(|parameters| self.tx_prepare_query_raw(&tx, "topition_insert.sql", parameters))
-                .chain(
-                    (0..topic.num_partitions)
-                        .map(|partition| {
-                            let cluster =
-                                Box::new(self.cluster.clone()) as Box<dyn ToSql + Sync + Send>;
-                            let name = Box::new(topic.name.clone()) as Box<dyn ToSql + Sync + Send>;
-                            let partition = Box::new(partition) as Box<dyn ToSql + Sync + Send>;
-                            [cluster, name, partition]
-                        })
-                        .map(|parameters| {
-                            self.tx_prepare_query_raw(&tx, "watermark_insert.sql", parameters)
-                        }),
-                ),
-        )
-        .await?;
+        // The watermark insert selects the topition rows that the topition insert creates, so
+        // every topition insert must finish before the first watermark insert is sent. Each
+        // statement is awaited before the next one is sent on this transaction's connection,
+        // which keeps that order. A watermark insert that finds no topition row matches no
+        // rows without an error, leaving a topic that rejects every produce.
+        for sql in ["topition_insert.sql", "watermark_insert.sql"] {
+            for partition in 0..topic.num_partitions {
+                let inserted = self
+                    .tx_prepare_execute(&tx, sql, &[&self.cluster, &topic.name, &partition])
+                    .await?;
+
+                if inserted != 1 {
+                    return Err(Error::Message(format!(
+                        "{sql} did not insert one row per partition of {} in {}",
+                        topic.name, self.cluster
+                    )));
+                }
+            }
+        }
 
         if let Some(configs) = topic.configs {
             for config in configs {
@@ -4139,6 +4111,7 @@ static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::future;
     use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
     use rand::distr::Alphanumeric;
 
@@ -6568,6 +6541,71 @@ mod tests {
             records.len(),
             "all committed records must be served regardless of unrelated open transactions",
         );
+
+        Ok(())
+    }
+
+    /// The watermark insert selects the topition row that the topition insert creates, so
+    /// `create_topic` must finish the second before sending the first. When it sent both
+    /// together, a connection holding only the watermark statement in its statement cache
+    /// sent the watermark insert first; it matched no rows without an error, and the topic
+    /// had no watermark, so every produce to it failed with `UnknownTopicOrPartition`. No
+    /// current caller leaves the cache in that state; this test sets it up directly.
+    #[tokio::test]
+    async fn create_topic_writes_the_watermark_when_only_its_statement_is_cached() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!(
+                "skipping create_topic_writes_the_watermark_when_only_its_statement_is_cached: {err:?}"
+            );
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        {
+            let c = storage.connection().await?;
+            _ = c
+                .prepare_cached(storage.sql_lookup("watermark_insert.sql")?)
+                .await?;
+        }
+
+        assert_eq!(
+            1,
+            storage.pool.status().size,
+            "one connection holds the cache"
+        );
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let stage = storage.offset_stage(&Topition::new(topic_name, 0)).await?;
+
+        assert_eq!(0, stage.high_watermark);
 
         Ok(())
     }
