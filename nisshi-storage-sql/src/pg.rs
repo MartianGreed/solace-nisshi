@@ -2890,6 +2890,10 @@ impl Storage for Postgres {
             )
             .await?;
 
+        // The foreign keys on `record` and `header` cascade from `topition`, so deleting
+        // the topitions below deletes the records and headers. Deleting them here with a
+        // join lets the planner scan the whole `record` table when its statistics are
+        // skewed (#982).
         for (description, sql) in [
             ("consumer_offsets", "consumer_offset_delete_by_topic.sql"),
             (
@@ -2897,8 +2901,6 @@ impl Storage for Postgres {
                 "topic_configuration_delete_by_topic.sql",
             ),
             ("watermarks", "watermark_delete_by_topic.sql"),
-            ("headers", "header_delete_by_topic.sql"),
-            ("records", "record_delete_by_topic.sql"),
             (
                 "txn_offset_commit_tp",
                 "txn_offset_commit_tp_delete_by_topic.sql",
