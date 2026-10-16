@@ -47,6 +47,23 @@ static FETCH_OFFSET_OUT_OF_BOUNDS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Partitions that a Fetch answers with `UNKNOWN_TOPIC_OR_PARTITION` although
+/// their topic exists, by `topic` and by `source`: `request` for an index
+/// outside the topic's partitions, and `storage` for a partition that the
+/// metadata listed and storage then reported unknown. A Fetch counts once
+/// per poll round. A `storage` count that does not stop points at metadata
+/// and storage that disagree.
+static FETCH_UNKNOWN_PARTITION: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_fetch_unknown_partition")
+        .with_description(
+            "Fetch partitions of an existing topic answered UNKNOWN_TOPIC_OR_PARTITION, by \
+             source: request (an index outside the topic) or storage (storage reported the \
+             partition unknown after the metadata listed it); counted once per poll round",
+        )
+        .build()
+});
+
 /// How long past the client's `max_wait` a Fetch may spend reading storage.
 ///
 /// A client abandons a Fetch at its own read deadline, then sends it again
@@ -382,6 +399,9 @@ where
         // before it reaches storage. The bounds are the same for every
         // isolation level, as in Kafka.
         let offset_stage = match before(cap, self.storage.offset_stage(&tp)).await {
+            Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
+                return Ok(Self::unknown_to_storage(&tp, "offset_stage"));
+            }
             Ok(offset_stage) => offset_stage.inspect_err(|error| error!(?error, ?tp))?,
             Err(reason) => {
                 missed(&tp, "offset_stage", fetch_offset, reason, started_at);
@@ -479,6 +499,9 @@ where
             )
             .await
             {
+                Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
+                    return Ok(Self::unknown_to_storage(&tp, "fetch"));
+                }
                 Ok(fetched) => fetched,
                 Err(reason) => {
                     missed(&tp, "fetch", offset, reason, started_at);
@@ -552,6 +575,9 @@ where
             )
             .await
             {
+                Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
+                    return Ok(Self::unknown_to_storage(&tp, "offset_stage"));
+                }
                 Ok(offset_stage) => offset_stage.inspect_err(|error| error!(?error, ?tp))?,
                 Err(reason) => {
                     missed(&tp, "offset_stage", offset, reason, started_at);
@@ -646,27 +672,53 @@ where
             .partitions(fetch.partitions.as_ref().map(|partitions| {
                 partitions
                     .iter()
-                    .map(|partition| {
-                        PartitionData::default()
-                            .partition_index(partition.partition)
-                            .error_code(ErrorCode::UnknownTopicOrPartition.into())
-                            .high_watermark(0)
-                            .last_stable_offset(Some(0))
-                            .log_start_offset(Some(-1))
-                            .diverging_epoch(Some(
-                                EpochEndOffset::default().epoch(-1).end_offset(-1),
-                            ))
-                            // Kafka sends a leader hint only with a leadership
-                            // error; librdkafka acts on one here, and its
-                            // consumer close then hangs on a deleted topic
-                            .current_leader(None)
-                            .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
-                            .aborted_transactions(Some([].into()))
-                            .preferred_read_replica(Some(-1))
-                            .records(None)
-                    })
+                    .map(|partition| Self::unknown_partition(partition.partition))
                     .collect()
             })))
+    }
+
+    /// The answer for a partition that storage reports as unknown after the
+    /// request read the topic's metadata, because the topic was deleted, or
+    /// recreated with fewer partitions, in between.
+    ///
+    /// Storage reports it with [`ErrorCode::UnknownTopicOrPartition`] (see
+    /// [`Storage::offset_stage`]), and the request answers it in the
+    /// response, as for any other unknown partition, instead of closing the
+    /// connection. The answer is counted in `nisshi_fetch_unknown_partition`
+    /// with `source` `storage`, because a count that does not stop shows
+    /// metadata and storage that disagree.
+    fn unknown_to_storage(tp: &Topition, operation: &'static str) -> PartitionData {
+        debug!(?tp, operation, "storage reports the partition unknown");
+
+        FETCH_UNKNOWN_PARTITION.add(
+            1,
+            &[
+                KeyValue::new("topic", tp.topic().to_owned()),
+                KeyValue::new("source", "storage"),
+            ],
+        );
+
+        Self::unknown_partition(tp.partition())
+    }
+
+    /// The answer for a partition that the topic does not have, and for
+    /// each partition of an unknown topic.
+    fn unknown_partition(partition_index: i32) -> PartitionData {
+        PartitionData::default()
+            .partition_index(partition_index)
+            .error_code(ErrorCode::UnknownTopicOrPartition.into())
+            .high_watermark(0)
+            .last_stable_offset(Some(0))
+            .log_start_offset(Some(-1))
+            .diverging_epoch(Some(EpochEndOffset::default().epoch(-1).end_offset(-1)))
+            // Kafka sends a leader hint only with a leadership error;
+            // librdkafka acts on one here, and its consumer close then hangs
+            // on a deleted topic
+            .current_leader(None)
+            .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
+            .aborted_transactions(Some([].into()))
+            .preferred_read_replica(Some(-1))
+            .records(None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -687,13 +739,40 @@ where
             topic_id,
             name: Some(name),
             error_code,
+            partitions: topic_partitions,
             ..
         }) = metadata.topics().first()
             && *error_code == i16::from(ErrorCode::None)
         {
+            // Every engine numbers a topic's partitions from 0, so the count
+            // bounds the valid indexes without a scan for each partition.
+            let partition_count = topic_partitions.as_deref().map_or(0, <[_]>::len);
+
             let mut partitions = Vec::new();
+            let mut outside_topic = 0;
 
             for fetch_partition in fetch.partitions.as_ref().unwrap_or(&Vec::new()) {
+                // Kafka answers a partition that the topic does not have
+                // before it reads any log, so that partition does not end the
+                // wait for `min_bytes`:
+                // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L806-L811
+                // The index must not reach storage, because some engines keep
+                // state for each partition that they read.
+                if !usize::try_from(fetch_partition.partition)
+                    .is_ok_and(|index| index < partition_count)
+                {
+                    *left = left.saturating_sub(1);
+                    outside_topic += 1;
+                    partitions.push(Self::unknown_partition(fetch_partition.partition));
+
+                    // A request can hold millions of such indexes, and this
+                    // branch does not await, so it yields to the runtime once
+                    // its budget is spent instead of holding the worker for
+                    // the whole request.
+                    tokio::task::consume_budget().await;
+                    continue;
+                }
+
                 let partition_max_bytes = if *is_first_non_empty {
                     *max_bytes
                 } else {
@@ -729,6 +808,21 @@ where
                     max_bytes.saturating_sub(partition_max_bytes.saturating_sub(partition_bytes));
 
                 partitions.push(partition);
+            }
+
+            if outside_topic > 0 {
+                debug!(
+                    topic = name,
+                    outside_topic, partition_count, "fetch of partitions outside the topic"
+                );
+
+                FETCH_UNKNOWN_PARTITION.add(
+                    outside_topic,
+                    &[
+                        KeyValue::new("topic", name.to_owned()),
+                        KeyValue::new("source", "request"),
+                    ],
+                );
             }
 
             Ok(FetchableTopicResponse::default()
@@ -991,7 +1085,7 @@ impl ByteSize for FetchableTopicResponse {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1015,7 +1109,7 @@ mod tests {
         incremental_alter_configs_request::AlterConfigsResource,
         incremental_alter_configs_response::AlterConfigsResourceResponse,
         list_groups_response::ListedGroup,
-        metadata_response::MetadataResponseTopic,
+        metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
         record::{Record, deflated, inflated},
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
     };
@@ -1304,6 +1398,12 @@ mod tests {
         offset_stage: OffsetStage,
         offset_stage_reads: Arc<AtomicUsize>,
         stage_growth: i64,
+        /// Offset stage reads, counted from 0, from which the partition is
+        /// unknown to storage.
+        unknown_from_stage_read: Option<usize>,
+        /// Records reads, counted from 1, from which the partition is
+        /// unknown to storage.
+        unknown_from_fetch_call: Option<usize>,
     }
 
     impl Scripted {
@@ -1315,6 +1415,8 @@ mod tests {
                 offset_stage,
                 offset_stage_reads: Arc::new(AtomicUsize::new(0)),
                 stage_growth: 0,
+                unknown_from_stage_read: None,
+                unknown_from_fetch_call: None,
             }
         }
 
@@ -1347,6 +1449,13 @@ mod tests {
                 calls.len()
             };
 
+            if self
+                .unknown_from_fetch_call
+                .is_some_and(|unknown_from| calls >= unknown_from)
+            {
+                return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+            }
+
             let response = {
                 let mut responses = self.responses.lock()?;
 
@@ -1370,6 +1479,14 @@ mod tests {
 
         async fn offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
             let reads = self.offset_stage_reads.fetch_add(1, Ordering::SeqCst);
+
+            if self
+                .unknown_from_stage_read
+                .is_some_and(|unknown_from| reads >= unknown_from)
+            {
+                return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+            }
+
             let growth = self.stage_growth * i64::try_from(reads)?;
 
             Ok(OffsetStage {
@@ -1854,6 +1971,9 @@ mod tests {
         /// A stage read not listed answers at once.
         offset_stage_delays: Arc<Mutex<StageDelays>>,
         offset_stage_reads: Arc<Mutex<BTreeMap<(String, i32), usize>>>,
+        /// Partitions of [`TOPIC`] that the metadata lists, and whose
+        /// offset stage read answers [`ErrorCode::UnknownTopicOrPartition`].
+        deleted: Arc<Mutex<BTreeSet<i32>>>,
         calls: Arc<Mutex<Vec<Call>>>,
     }
 
@@ -1893,6 +2013,13 @@ mod tests {
                 .lock()
                 .expect("offset stage delays")
                 .insert((TOPIC.into(), partition, read), delay);
+            self
+        }
+
+        /// Makes `partition` of [`TOPIC`] look deleted after the request
+        /// read the metadata.
+        fn delete_after_metadata(self, partition: i32) -> Self {
+            _ = self.deleted.lock().expect("deleted").insert(partition);
             self
         }
 
@@ -1983,6 +2110,10 @@ mod tests {
                 tokio::time::sleep(delay).await;
             }
 
+            if topition.topic() == TOPIC && self.deleted.lock()?.contains(&topition.partition()) {
+                return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+            }
+
             Ok(OffsetStage {
                 last_stable: 1_000,
                 high_watermark: 1_000,
@@ -1990,6 +2121,8 @@ mod tests {
             })
         }
 
+        /// Lists each scripted topic with partitions up to its highest
+        /// scripted index.
         async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
             let known = {
                 let scripts = self.scripts.lock()?;
@@ -2001,7 +2134,14 @@ mod tests {
                         TopicId::Name(name) => Some(name.clone()),
                         TopicId::Id(_) => None,
                     })
-                    .filter(|name| scripts.keys().any(|(topic, _)| topic == name))
+                    .filter_map(|name| {
+                        scripts
+                            .keys()
+                            .filter(|(topic, _)| *topic == name)
+                            .map(|(_, partition)| *partition)
+                            .max()
+                            .map(|highest| (name, highest))
+                    })
                     .collect::<Vec<_>>()
             };
 
@@ -2011,11 +2151,20 @@ mod tests {
                 brokers: vec![],
                 topics: known
                     .into_iter()
-                    .map(|name| {
+                    .map(|(name, highest)| {
                         MetadataResponseTopic::default()
                             .error_code(ErrorCode::None.into())
                             .name(Some(name))
                             .topic_id(Some([1; 16]))
+                            .partitions(Some(
+                                (0..=highest)
+                                    .map(|partition| {
+                                        MetadataResponsePartition::default()
+                                            .error_code(ErrorCode::None.into())
+                                            .partition_index(partition)
+                                    })
+                                    .collect(),
+                            ))
                     })
                     .collect(),
             })
@@ -2503,6 +2652,157 @@ mod tests {
             ErrorCode::try_from(topics[0][0].error_code)?
         );
         assert_eq!(0, batches(&topics[1][0]));
+
+        Ok(())
+    }
+
+    /// A partition that storage reports as unknown at any of its reads
+    /// answers `UNKNOWN_TOPIC_OR_PARTITION` in the response, and the read
+    /// does not fail.
+    #[tokio::test(start_paused = true)]
+    async fn storage_unknown_partition_at_each_read_answers_in_band() -> Result<()> {
+        // records up to offset 3, past a high watermark of 1, so the offset
+        // stage is read again after the records
+        let stage = OffsetStage {
+            last_stable: 1,
+            high_watermark: 1,
+            log_start: 0,
+        };
+
+        let cases = [
+            (
+                "first offset stage read",
+                Scripted {
+                    unknown_from_stage_read: Some(0),
+                    ..Scripted::new(vec![], stage)
+                },
+            ),
+            (
+                "records read",
+                Scripted {
+                    unknown_from_fetch_call: Some(1),
+                    ..Scripted::new(vec![], stage)
+                },
+            ),
+            (
+                "offset stage read after the records",
+                Scripted {
+                    unknown_from_stage_read: Some(1),
+                    ..Scripted::new(vec![vec![batch(0, &[0, 3])?], vec![]], stage)
+                },
+            ),
+        ];
+
+        for (name, storage) in cases {
+            let partition = fetch_partition_at(
+                storage,
+                Duration::from_secs(1),
+                1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                0,
+            )
+            .await?;
+
+            assert_eq!(
+                ErrorCode::UnknownTopicOrPartition,
+                ErrorCode::try_from(partition.error_code)?,
+                "{name}"
+            );
+            assert_eq!(None, partition.records, "{name}");
+        }
+
+        Ok(())
+    }
+
+    /// A partition index outside the topic answers
+    /// `UNKNOWN_TOPIC_OR_PARTITION` without reaching storage, and the
+    /// partitions that the topic has are read as usual.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_partition_index_skips_storage() -> Result<()> {
+        let storage = Partitions::new([(0, vec![Read::Batch(batch(0, &[0])?)]), (1, vec![])]);
+
+        let unknown = [-1, 2, i32::MAX];
+
+        let (partitions, _) = fetch(storage.clone(), &[0, -1, 2, i32::MAX]).await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(1, batches(&partitions[0]));
+
+        for (answer, index) in partitions[1..].iter().zip(unknown) {
+            assert_eq!(index, answer.partition_index);
+            assert_eq!(
+                ErrorCode::UnknownTopicOrPartition,
+                ErrorCode::try_from(answer.error_code)?
+            );
+            assert_eq!(0, storage.offset_stage_reads(index));
+            assert_eq!(Vec::<Call>::new(), storage.calls(index));
+        }
+
+        Ok(())
+    }
+
+    /// A request for only partitions that the topic does not have answers
+    /// at once, as Kafka does.
+    #[tokio::test(start_paused = true)]
+    async fn only_unknown_partitions_answer_without_waiting() -> Result<()> {
+        let storage = Partitions::new([(0, vec![])]);
+
+        let (partitions, elapsed) = fetch(storage, &[1, -1]).await?;
+
+        assert_eq!(Duration::ZERO, elapsed);
+        assert!(
+            partitions
+                .iter()
+                .all(|partition| partition.error_code
+                    == i16::from(ErrorCode::UnknownTopicOrPartition))
+        );
+
+        Ok(())
+    }
+
+    /// A partition that the topic does not have does not end the wait for
+    /// `min_bytes` while another partition is fine, as in Kafka.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_partition_does_not_end_the_wait() -> Result<()> {
+        let storage = Partitions::new([(0, vec![])]);
+
+        let (partitions, elapsed) = fetch(storage, &[0, 1]).await?;
+
+        assert_eq!(MAX_WAIT, elapsed);
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(
+            ErrorCode::UnknownTopicOrPartition,
+            ErrorCode::try_from(partitions[1].error_code)?
+        );
+
+        Ok(())
+    }
+
+    /// A partition that storage reports as unknown, after the request read
+    /// the metadata, answers `UNKNOWN_TOPIC_OR_PARTITION` in the response,
+    /// and the request goes on.
+    #[tokio::test(start_paused = true)]
+    async fn storage_unknown_partition_answers_in_band() -> Result<()> {
+        let storage = Partitions::new([(0, vec![]), (1, vec![Read::Batch(batch(0, &[0])?)])])
+            .delete_after_metadata(0);
+
+        let (partitions, _) = fetch(storage, &[0, 1]).await?;
+
+        assert_eq!(
+            ErrorCode::UnknownTopicOrPartition,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[1].error_code)?
+        );
+        assert_eq!(1, batches(&partitions[1]));
 
         Ok(())
     }
