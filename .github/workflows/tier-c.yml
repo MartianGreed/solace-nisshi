@@ -113,11 +113,28 @@ jobs:
       - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest@0.9.146
-      # Set on the step, as in ci.yml: the cache key hashes `RUST*` variables.
-      - run: just test
+      # The test and report steps match ci.yml's `test` job, which explains
+      # them.
+      #
+      # RUST_BACKTRACE and RUST_LOG are set on each step, as in ci.yml: the
+      # cache key hashes `RUST*` variables.
+      - id: nextest
+        run: just test-workspace --timings
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug,nisshi_sans_io=warn,nisshi_model=warn
+      - if: ${{ !cancelled() && steps.nextest.outcome != 'skipped' }}
+        run: just test-doc
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug,nisshi_sans_io=warn,nisshi_model=warn
+      - if: ${{ !cancelled() && steps.nextest.outcome != 'skipped' }}
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: ./.github/actions/test-reports
+        with:
+          title: Rust tests (${{ matrix.pg }})
+          artifact-name: test-reports-${{ env.PG_IMAGE_DASH }}
       - run: df -h
         if: always()
       - run: tar --create --verbose --gzip --file="logs-${PG_IMAGE_DASH}.tar.gz" logs
