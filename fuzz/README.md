@@ -20,6 +20,8 @@ To move a target between tiers, change its budget, or stop running it in CI, edi
 
 The PR job has a 50 minute timeout and each nightly job 75 minutes. The six `pr` budgets add up to 6 minutes of fuzzing, after a build that takes about 33 minutes from scratch (10 of it dependencies, which the Rust cache saves from `main`) and, measured on a PR run with that cache, about 19 minutes. If the budgets outgrow those, raise `timeout-minutes` in `.github/workflows/fuzz.yml` too.
 
+The `fuzz_<api>_storage` targets run in `nightly` only, 15 minutes each. `just fuzz-ci pr` builds only the targets of the `pr` tier, because a storage target links the whole storage stack and takes several minutes to build, which the `pr` job's timeout can't afford for all of them.
+
 ## Adding a target
 
 1. Add `fuzz_targets/<name>.rs` and a `[[bin]]` entry in `Cargo.toml` (copy an existing one).
