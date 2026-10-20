@@ -34,6 +34,7 @@ pub mod gap6;
 pub mod mandatory_sequence_encoding;
 pub mod proptest;
 pub mod redact;
+pub mod response_length_bound;
 pub mod snappy;
 pub mod topic;
 pub mod version;
