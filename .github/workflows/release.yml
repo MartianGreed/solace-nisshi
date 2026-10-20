@@ -3,11 +3,21 @@ name: release
 # The only workflow a `v*` tag runs. It calls ci.yml for the build and every
 # test, then publishes in order: the version tags on the image, the tarballs
 # on the GitHub release, then the crates. Each step needs the one before, and
-# the first needs `ci`, `on-main` and `release-tag`, so a red run publishes
+# the first needs `ci`, `on-main`, `release-tag` and `release-readiness` (the
+# Guardian scan of the tag), so a red run or a Guardian block publishes
 # nothing. A check that must also pass before a release goes in
 # publish-image's `needs`. This workflow creates the GitHub release without a
 # body. The /cut-release skill drafts the body from CHANGELOG.md after the run
 # and sets it with `gh release edit`.
+#
+# Publishing over a Guardian block: a repo admin dispatches this workflow on
+# the tag with skip_security_checks, e.g.
+#   gh workflow run release.yml --ref v0.8.0 -f skip_security_checks=true
+# release-readiness-check.yaml checks the actor is an admin; for anyone else
+# the gate still enforces.
+# That skips both the Guardian gate and the FOSSA licensing block. To skip
+# only the licensing block, set the FOSSA_LICENSING_BLOCK repository variable
+# to false (see guardian-scan.yaml) and push the tag as usual.
 #
 # The file name stays release.yml: the crates.io trusted publisher is bound
 # to it.
@@ -17,12 +27,33 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      skip_security_checks:
+        description: "Admin-only: publish even if Guardian blocks. Run on the tag ref."
+        required: false
+        type: boolean
+        default: false
 # One release run per tag, never cancelled part-way through publishing.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 jobs:
+  # A dispatch can name any ref; only a `v*` tag is a release.
+  tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          case "${REF_TYPE}:${GITHUB_REF_NAME}" in
+            tag:v*) echo "releasing ${GITHUB_REF_NAME}" ;;
+            *) echo "::error::${GITHUB_REF} is not a v* tag; dispatch this workflow on the tag to release it"; exit 1 ;;
+          esac
+
   ci:
+    needs: [tag]
     # A called workflow's jobs can't hold more than this job grants, so this
     # lists every permission a ci.yml job declares: `changes` reads the PR
     # files, and ci-gate lists the run's jobs for its timings.
@@ -42,6 +73,7 @@ jobs:
   # repository is public or private: main is `ahead` of the tagged commit, or
   # `identical` to it, exactly when the commit is on main.
   on-main:
+    needs: [tag]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -59,6 +91,7 @@ jobs:
   # version, and a stable tag whose CHANGELOG.md section is missing or empty.
   # See .github/scripts/check-release-tag.sh.
   release-tag:
+    needs: [tag]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -67,11 +100,39 @@ jobs:
           persist-credentials: false
       - run: bash .github/scripts/check-release-tag.sh "${GITHUB_REF_NAME}"
 
+  # The Guardian scan of the tag, in trunk mode: FOSSA and Prisma upload under
+  # the tag's version, then the Guardian gate blocks on its verdict unless an
+  # admin dispatched with skip_security_checks.
+  release-readiness:
+    needs: [tag]
+    permissions:
+      contents: read
+      packages: read        # ceiling for guardian-scan's FOSSA job (private scan container)
+      pull-requests: write
+      checks: write
+      statuses: write
+      # Same ceiling as release-readiness-check.yaml: the subset rule applies at
+      # every workflow_call hop. Not a capability this path uses.
+      id-token: write
+    uses: ./.github/workflows/release-readiness-check.yaml # zizmor: ignore[secrets-inherit]
+    # `secrets: inherit` is load-bearing on both hops of this chain. A workflow
+    # reached via `workflow_call` starts with an empty `secrets` context, and
+    # that extends to the called workflow's own `environment:` layer; `inherit`
+    # is what opens it. Without it guardian-scan.yaml's `environment: guardian`
+    # jobs read all six secrets as empty strings and every scan job fails.
+    # Naming the secrets instead is not possible: five live only in the
+    # `guardian` environment, which a `uses:` job cannot enter. Nothing on PR
+    # CI exercises this path; only a tag run does.
+    secrets: inherit
+    with:
+      version: ${{ github.ref_name }}
+      skip_security_checks: ${{ inputs.skip_security_checks || false }}
+
   # The multi-arch image, built from the binaries smoke tested by the same
   # action as tier-c.yml's `edge-publish`, tagged with the version. `latest` comes with the
   # semver tags, for a tag that isn't a prerelease.
   publish-image:
-    needs: [ci, on-main, release-tag]
+    needs: [ci, on-main, release-tag, release-readiness]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

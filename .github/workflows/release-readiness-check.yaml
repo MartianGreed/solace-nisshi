@@ -1,0 +1,94 @@
+name: Release Readiness Check
+
+# Re-runs the Guardian scan (trunk mode) against a ref and blocks on the gate.
+# Run it on demand before tagging; release.yml also calls it on every `v*`
+# tag, and publishes nothing unless it passes. skip_security_checks lets a
+# repo admin (only) publish over a Guardian block.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version / ref to check (branch, tag, or SHA)."
+        required: true
+        type: string
+      skip_security_checks:
+        description: "Admin-only: continue even if Guardian blocks."
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      skip_security_checks:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  authorize:
+    name: Authorize security bypass
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      fail_on_blocked: ${{ steps.decide.outputs.fail_on_blocked }}
+    steps:
+      - name: Resolve bypass authorisation
+        id: decide
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          # Pass the input through env, never interpolated into the script body:
+          # this is the one control between a Guardian block and a publish.
+          SKIP_SECURITY_CHECKS: ${{ inputs.skip_security_checks }}
+        with:
+          script: |
+            const skip = process.env.SKIP_SECURITY_CHECKS === 'true';
+            if (!skip) {
+              core.setOutput('fail_on_blocked', 'true');
+              return;
+            }
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.actor,
+            });
+            const admin = data.permission === 'admin';
+            core.setOutput('fail_on_blocked', admin ? 'false' : 'true');
+            core.warning(admin
+              ? `Security bypass authorised for admin ${context.actor}.`
+              : `${context.actor} is not an admin (${data.permission}); bypass denied.`);
+
+  guardian:
+    name: Guardian gate
+    needs: authorize
+    uses: ./.github/workflows/guardian-scan.yaml # zizmor: ignore[secrets-inherit]
+    permissions:
+      contents: read
+      packages: read        # ceiling for guardian-scan's FOSSA job (private scan container)
+      pull-requests: write
+      checks: write
+      statuses: write
+      # Ceiling for guardian-scan's `update-manifest` job (OIDC). It writes no
+      # row on this path, but a reusable workflow's permissions must be a
+      # SUBSET of the caller's - under-granting fails at run creation.
+      id-token: write
+    # Load-bearing - do not remove, and do not replace with named secrets.
+    # `environment: guardian` on guardian-scan's jobs does not resolve their
+    # secrets when the workflow is reached via `workflow_call`: the `secrets`
+    # context arrives empty unless the caller opens it, so all six come through
+    # as empty strings and every scan job fails. Five of them exist only in the
+    # `guardian` environment, which a `uses:` job cannot enter, so naming them
+    # here is impossible, not merely verbose. release.yml's call of this
+    # workflow carries the same directive for the same reason.
+    secrets: inherit
+    with:
+      git_ref: ${{ inputs.version }}
+      product_full_version: ${{ inputs.version }}
+      fail_on_blocked: ${{ needs.authorize.outputs.fail_on_blocked == 'true' }}
