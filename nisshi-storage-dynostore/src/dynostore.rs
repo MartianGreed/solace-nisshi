@@ -3049,22 +3049,44 @@ impl Storage for DynoStore {
                         results.push(NamedGroupDetail::found(group_id.into(), group_detail));
                     }
 
-                    Err(Error::ObjectStore(error)) => match error.as_ref() {
-                        object_store::Error::NotFound { .. } => {
-                            results.push(NamedGroupDetail::found(
+                    // A group that commits offsets and never joins has no state object. The
+                    // group exists while any of its committed offsets remains.
+                    Err(Error::ObjectStore(error))
+                        if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
+                    {
+                        let offsets_prefix = self.group_offsets_prefix(group_id)?;
+
+                        match self.object_store.list(Some(&offsets_prefix)).next().await {
+                            Some(Ok(_)) => results.push(NamedGroupDetail::found(
                                 group_id.into(),
                                 GroupDetail::default(),
-                            ));
-                        }
+                            )),
 
-                        _otherwise => {
-                            results.push(NamedGroupDetail::found(
+                            None => results.push(NamedGroupDetail::error_code(
                                 group_id.into(),
-                                GroupDetail::default(),
-                            ));
-                        }
-                    },
+                                ErrorCode::GroupIdNotFound,
+                            )),
 
+                            Some(Err(err)) => {
+                                error!(?err, group_id);
+                                results.push(NamedGroupDetail::error_code(
+                                    group_id.into(),
+                                    ErrorCode::CoordinatorNotAvailable,
+                                ));
+                            }
+                        }
+                    }
+
+                    // An object store error is usually transient. Kafka clients retry
+                    // `COORDINATOR_NOT_AVAILABLE`, and fail on `UNKNOWN_SERVER_ERROR`.
+                    Err(Error::ObjectStore(_)) => {
+                        results.push(NamedGroupDetail::error_code(
+                            group_id.into(),
+                            ErrorCode::CoordinatorNotAvailable,
+                        ));
+                    }
+
+                    // A retry does not fix a stored group that can't be decoded.
                     Err(_) => {
                         results.push(NamedGroupDetail::error_code(
                             group_id.into(),
