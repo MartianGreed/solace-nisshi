@@ -172,6 +172,7 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 - Find the run: `gh run list --workflow release.yml --branch TAG --event push --json databaseId,status`. A queued run is normal. If no run shows up within two minutes of the push, stop and report it, because a tag ruleset or a disabled workflow stops the trigger.
 - Watch it in the background with `gh run watch <id> --exit-status`.
 - If `release-readiness` fails, the run waits at the `override` job for a repo admin to approve it in the `release-override` environment. Report which scan job failed and why, and leave the decision to the operator. Never approve or reject the deployment yourself.
+- If the operator set `FOSSA_LICENSING_BLOCK=false` for this release, delete it with `gh variable delete FOSSA_LICENSING_BLOCK` once the `Resolve context` job of `release-readiness` has run. It turns off the licensing block for every trunk run until it is removed.
 - Pre-release: the body is two paragraphs. The first is fixed, with `X.Y.Z` being `VERSION` without its `-pre.N`:
 
   ```markdown
@@ -187,11 +188,12 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 
 ## 9. Report
 
-Report the run URL and its conclusion.
+Report the run URL and its conclusion, and whether the `FOSSA_LICENSING_BLOCK` variable is still set (`gh variable list`).
 
 - **On failure:** say which job failed and what it had already published. The jobs run in order:
   - `ci`, `on-main` or `release-tag` failed, or `release-readiness` failed and the `override` deployment was rejected: nothing was published. The tag stays, because a tag is never moved or deleted. Fix `main`, then cut the next version. Phase 1 skips this tag's version, because it has no GitHub release.
-  - `github-release` failed: the image is pushed. A flaky failure is `gh run rerun <id> --failed`. The rerun needs the `image-*` artifacts of the same run, which `ci.yml` keeps for 3 days.
+  - `release-readiness` failed and the `override` was approved: the run still ends as a failure, so judge it by the publish jobs. If they all passed, run the success checks below. If `github-release` failed, re-run only that job and the ones after it with `gh run rerun <id> --job <job id>` (the job's `databaseId` from `gh run view <id> --json jobs`), never `--failed`, which would also re-run `release-readiness` and `publish-image` and push the image again.
+  - `github-release` failed: the image is pushed. A flaky failure is `gh run rerun <id> --failed` only when `release-readiness` passed. The rerun needs the `image-*` artifacts of the same run, which `ci.yml` keeps for 3 days.
   - `publish-crates` failed: the image and the GitHub release are out. Before any rerun, list which crates are on crates.io at `VERSION` (the check in the success list below). `cargo publish --workspace` fails on a crate version that crates.io already has, so a rerun after a partial upload fails. Stop and report the missing crates to the operator.
   - A real failure, not a flaky one, is fixed on `main` and released as the next version, never by moving the tag.
 - **On success,** run these checks and report each result:

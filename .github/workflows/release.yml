@@ -123,9 +123,27 @@ jobs:
     environment: release-override
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions: {}
+    permissions:
+      actions: read
     steps:
-      - run: echo "::warning::publishing ${GITHUB_REF_NAME} over a failed release-readiness check"
+      # A missing environment is created on first use with no reviewers, and
+      # this job then starts without waiting for anyone. Refuse to pass the
+      # publish jobs unless the environment still has its protection.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rules=$(gh api "repos/${GITHUB_REPOSITORY}/environments/release-override" \
+            --jq '[.protection_rules[]? | select(.type == "required_reviewers")]')
+          if [ "$(jq length <<<"$rules")" -eq 0 ]; then
+            echo "::error::release-override has no required reviewers; not publishing over a failed release-readiness check"
+            exit 1
+          fi
+          if [ "$(jq '[.[] | select(.prevent_self_review == true)] | length' <<<"$rules")" -eq 0 ]; then
+            echo "::error::release-override allows self-review; not publishing over a failed release-readiness check"
+            exit 1
+          fi
+          echo "::warning::publishing ${GITHUB_REF_NAME} over a failed release-readiness check"
 
   # The multi-arch image, built from the binaries smoke tested by the same
   # action as tier-c.yml's `edge-publish`, tagged with the version. `latest` comes with the
