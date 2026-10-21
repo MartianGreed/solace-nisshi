@@ -10,14 +10,17 @@ name: release
 # body. The /cut-release skill drafts the body from CHANGELOG.md after the run
 # and sets it with `gh release edit`.
 #
-# Publishing over a Guardian block: a repo admin dispatches this workflow on
-# the tag with skip_security_checks, e.g.
-#   gh workflow run release.yml --ref v0.8.0 -f skip_security_checks=true
-# release-readiness-check.yaml checks the actor is an admin; for anyone else
-# the gate still enforces.
-# That skips both the Guardian gate and the FOSSA licensing block. To skip
-# only the licensing block, set the FOSSA_LICENSING_BLOCK repository variable
-# to false (see guardian-scan.yaml) and push the tag as usual.
+# Publishing over a failed release-readiness check: when it fails and the
+# other three pass, the `override` job waits in the `release-override`
+# environment, whose required reviewers are repo admins. Approving it
+# publishes from this run, over a Guardian block or a scanner or Guardian
+# outage alike; rejecting it ends the run with nothing published. GitHub asks
+# for approval again on a re-run, and the deployment log records who approved.
+#
+# To skip only the FOSSA licensing block, set the FOSSA_LICENSING_BLOCK
+# repository variable to false (see guardian-scan.yaml) before pushing the
+# tag. A run reads it when it starts, and "Re-run failed jobs" keeps the
+# value it read, so after the tag is pushed the override is the way through.
 #
 # The file name stays release.yml: the crates.io trusted publisher is bound
 # to it.
@@ -27,33 +30,12 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      skip_security_checks:
-        description: "Admin-only: publish even if Guardian blocks. Run on the tag ref."
-        required: false
-        type: boolean
-        default: false
 # One release run per tag, never cancelled part-way through publishing.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  # A dispatch can name any ref; only a `v*` tag is a release.
-  tag:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - env:
-          REF_TYPE: ${{ github.ref_type }}
-        run: |
-          case "${REF_TYPE}:${GITHUB_REF_NAME}" in
-            tag:v*) echo "releasing ${GITHUB_REF_NAME}" ;;
-            *) echo "::error::${GITHUB_REF} is not a v* tag; dispatch this workflow on the tag to release it"; exit 1 ;;
-          esac
-
   ci:
-    needs: [tag]
     # A called workflow's jobs can't hold more than this job grants, so this
     # lists every permission a ci.yml job declares: `changes` reads the PR
     # files, and ci-gate lists the run's jobs for its timings.
@@ -73,7 +55,6 @@ jobs:
   # repository is public or private: main is `ahead` of the tagged commit, or
   # `identical` to it, exactly when the commit is on main.
   on-main:
-    needs: [tag]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -91,7 +72,6 @@ jobs:
   # version, and a stable tag whose CHANGELOG.md section is missing or empty.
   # See .github/scripts/check-release-tag.sh.
   release-tag:
-    needs: [tag]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -101,10 +81,11 @@ jobs:
       - run: bash .github/scripts/check-release-tag.sh "${GITHUB_REF_NAME}"
 
   # The Guardian scan of the tag, in trunk mode: FOSSA and Prisma upload under
-  # the tag's version, then the Guardian gate blocks on its verdict unless an
-  # admin dispatched with skip_security_checks.
+  # the tag's version, then the Guardian gate blocks on its verdict. It waits
+  # for on-main and release-tag, which take seconds, so a tag that can never
+  # publish is never filed in FOSSA or Guardian as trunk.
   release-readiness:
-    needs: [tag]
+    needs: [on-main, release-tag]
     permissions:
       contents: read
       packages: read        # ceiling for guardian-scan's FOSSA job (private scan container)
@@ -118,21 +99,43 @@ jobs:
     # `secrets: inherit` is load-bearing on both hops of this chain. A workflow
     # reached via `workflow_call` starts with an empty `secrets` context, and
     # that extends to the called workflow's own `environment:` layer; `inherit`
-    # is what opens it. Without it guardian-scan.yaml's `environment: guardian`
-    # jobs read all six secrets as empty strings and every scan job fails.
-    # Naming the secrets instead is not possible: five live only in the
-    # `guardian` environment, which a `uses:` job cannot enter. Nothing on PR
-    # CI exercises this path; only a tag run does.
+    # is what opens it. Without it guardian-scan.yaml's `guardian-trunk` jobs
+    # read every secret as an empty string and every scan job fails. Naming
+    # the secrets instead is not possible: they live in that environment,
+    # which a `uses:` job cannot enter. Nothing on PR CI exercises this path;
+    # only a tag run does.
     secrets: inherit
     with:
+      # The qualified ref, not the bare name: actions/checkout resolves a bare
+      # name to a branch before a tag, so a branch named after the version
+      # would be scanned in the tag's place.
+      ref: ${{ github.ref }}
       version: ${{ github.ref_name }}
-      skip_security_checks: ${{ inputs.skip_security_checks || false }}
+
+  # Runs only when release-readiness failed and everything else passed, and
+  # waits for a repo admin to approve it in the `release-override`
+  # environment. See the header.
+  override:
+    needs: [ci, on-main, release-tag, release-readiness]
+    if: >-
+      ${{ !cancelled() && needs.ci.result == 'success' && needs.on-main.result == 'success'
+      && needs.release-tag.result == 'success' && needs.release-readiness.result == 'failure' }}
+    environment: release-override
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - run: echo "::warning::publishing ${GITHUB_REF_NAME} over a failed release-readiness check"
 
   # The multi-arch image, built from the binaries smoke tested by the same
   # action as tier-c.yml's `edge-publish`, tagged with the version. `latest` comes with the
   # semver tags, for a tag that isn't a prerelease.
   publish-image:
-    needs: [ci, on-main, release-tag, release-readiness]
+    needs: [ci, on-main, release-tag, release-readiness, override]
+    if: >-
+      ${{ !cancelled() && needs.ci.result == 'success' && needs.on-main.result == 'success'
+      && needs.release-tag.result == 'success'
+      && (needs.release-readiness.result == 'success' || needs.override.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -154,8 +157,11 @@ jobs:
   # environment's deployment policy (`v*` tags) is a second, server-side check
   # on the ref. The image is pushed first, so a failed upload leaves an image
   # without a release page until this job is re-run.
+  # Explicit conditions on this job and the next: `override` is skipped on a
+  # passing run, and without them the skip would carry down the chain.
   github-release:
     needs: [publish-image]
+    if: ${{ !cancelled() && needs.publish-image.result == 'success' }}
     environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -180,6 +186,7 @@ jobs:
   # Last, because a crates.io publish can't be undone.
   publish-crates:
     needs: [github-release]
+    if: ${{ !cancelled() && needs.github-release.result == 'success' }}
     environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 30
