@@ -14,8 +14,10 @@ name: release
 # other three pass, the `override` job waits in the `release-override`
 # environment, whose required reviewers are repo admins. Approving it
 # publishes from this run, over a Guardian block or a scanner or Guardian
-# outage alike; rejecting it ends the run with nothing published. GitHub asks
-# for approval again on a re-run, and the deployment log records who approved.
+# outage alike; rejecting it ends the run with nothing published. The
+# environment prevents self-review, so another admin has to approve: whoever
+# pushed the tag or started the re-run can't. GitHub asks for approval again on a
+# re-run, and the deployment log records who approved.
 #
 # To skip only the FOSSA licensing block, set the FOSSA_LICENSING_BLOCK
 # repository variable to false (see guardian-scan.yaml) before pushing the

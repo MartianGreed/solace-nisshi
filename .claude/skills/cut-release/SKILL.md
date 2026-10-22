@@ -171,7 +171,7 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 
 - Find the run: `gh run list --workflow release.yml --branch TAG --event push --json databaseId,status`. A queued run is normal. If no run shows up within two minutes of the push, stop and report it, because a tag ruleset or a disabled workflow stops the trigger.
 - Watch it in the background with `gh run watch <id> --exit-status`.
-- If `release-readiness` fails, the run waits at the `override` job for a repo admin to approve it in the `release-override` environment. Report which scan job failed and why, and leave the decision to the operator. Never approve or reject the deployment yourself.
+- If `release-readiness` fails, the run waits at the `override` job for a repo admin to approve it in the `release-override` environment. Report which scan job failed and why, and leave the decision to the operator. The environment prevents self-review and the operator pushed the tag, so tell them a second admin has to approve it. Never approve or reject the deployment yourself.
 - If the operator set `FOSSA_LICENSING_BLOCK=false` for this release, delete it with `gh variable delete FOSSA_LICENSING_BLOCK` once the `Resolve context` job of `release-readiness` has run. It turns off the licensing block for every trunk run until it is removed.
 - Pre-release: the body is two paragraphs. The first is fixed, with `X.Y.Z` being `VERSION` without its `-pre.N`:
 
