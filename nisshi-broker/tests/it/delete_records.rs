@@ -372,9 +372,9 @@ where
 }
 
 /// `offset == -1` is the common case ("delete everything up to the high
-/// watermark"). It must leave the high watermark, and so `Latest`, unchanged,
-/// and `ListOffsets(Earliest)` must answer the new log start, which is the
-/// high watermark here.
+/// watermark"). The delete moves the log start to the high watermark and
+/// leaves the high watermark as it was, so `ListOffsets` answers the high
+/// watermark for both `Earliest` and `Latest`.
 pub async fn delete_to_high_watermark_keeps_latest<G>(
     cluster_id: Uuid,
     broker_id: i32,
