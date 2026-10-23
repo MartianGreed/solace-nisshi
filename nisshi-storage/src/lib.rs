@@ -185,7 +185,7 @@ use std::{
 };
 use tokio::{sync::AcquireError, task::JoinError};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, error};
 use tracing_subscriber::filter::ParseError;
 use url::Url;
 use uuid::Uuid;
@@ -221,7 +221,8 @@ pub use service::{
     MetadataService, ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver,
     RequestSender, RequestService, RequestStorageService, Response, TxnAddOffsetsService,
     TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest,
-    ValidatedFetchRequest, bounded_channel, inflate_produced,
+    ValidatedFetchRequest, bounded_channel, describe_groups_response, inflate_produced,
+    list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]
@@ -425,6 +426,23 @@ pub enum Error {
 
     UnableToSend,
     OneshotRecv,
+}
+
+impl Error {
+    /// Returns the error code that a group request, such as `ListGroups` or `DescribeGroups`,
+    /// reports when storage fails with this error.
+    ///
+    /// A storage error that carries a code keeps that code. Any other storage error is treated as
+    /// transient, so the response reports `COORDINATOR_NOT_AVAILABLE`, which Kafka clients
+    /// [retry].
+    ///
+    /// [retry]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java#L3614-L3620
+    pub fn group_request_error_code(&self) -> ErrorCode {
+        match self {
+            Self::Api(error_code) => *error_code,
+            _ => ErrorCode::CoordinatorNotAvailable,
+        }
+    }
 }
 
 impl Display for Error {
@@ -1179,25 +1197,54 @@ pub struct PendingSync {
     pub members: BTreeSet<String>,
 }
 
+impl ConsumerGroupState {
+    /// Returns whether `states_filter` matches this state. The filter is the list of state names
+    /// in a `ListGroups` request. As in Kafka, a missing or empty filter matches every state,
+    /// and each name in the filter matches without regard to case or surrounding white space.
+    pub fn matches(&self, states_filter: Option<&[String]>) -> bool {
+        states_filter.is_none_or(|states_filter| {
+            let state = self.to_string();
+
+            states_filter.is_empty()
+                || states_filter
+                    .iter()
+                    .any(|name| name.trim().eq_ignore_ascii_case(&state))
+        })
+    }
+}
+
+/// A classic group's state in Kafka, from the group's stored detail.
 impl From<&GroupDetail> for ConsumerGroupState {
     fn from(value: &GroupDetail) -> Self {
         match value {
-            GroupDetail { members, .. } if members.is_empty() => Self::Empty,
-
+            // A join phase continues after every member sends LeaveGroup during the initial delay,
+            // and the group stays in PreparingRebalance until the phase ends, as in Kafka.
             GroupDetail {
-                state: GroupState::Forming { leader: None, .. },
+                state: GroupState::Forming { .. },
+                rebalance,
                 ..
-            } => Self::Assigning,
+            } if rebalance.join_phase.is_some() => Self::PreparingRebalance,
+
+            GroupDetail { members, .. } if members.is_empty() => Self::Empty,
 
             GroupDetail {
                 state: GroupState::Formed { .. },
                 ..
             } => Self::Stable,
 
-            _ => {
-                debug!(unknown = ?value);
-                Self::Unknown
-            }
+            GroupDetail {
+                state: GroupState::Forming { .. },
+                rebalance,
+                ..
+            } if rebalance.pending_sync.is_some() => Self::CompletingRebalance,
+
+            // A broker that stored the group without its rebalance state held each request for a
+            // fixed time. The group coordinator gives such a group a join phase, so it is in
+            // PreparingRebalance.
+            GroupDetail {
+                state: GroupState::Forming { .. },
+                ..
+            } => Self::PreparingRebalance,
         }
     }
 }
@@ -1254,6 +1301,24 @@ impl NamedGroupDetail {
             response: GroupDetailResponse::Found(found),
         }
     }
+
+    /// Returns a group from its stored detail, as the storage read and decoded it. A group
+    /// without a stored detail has only committed offsets, so it is empty. A group whose detail
+    /// can't be read or decoded has an error instead of a detail, so that a list of groups still
+    /// includes the other groups.
+    pub fn decoded<E>(name: String, stored: Option<Result<GroupDetail, E>>) -> Self
+    where
+        E: Debug,
+    {
+        match stored {
+            Some(Ok(detail)) => Self::found(name, detail),
+            Some(Err(err)) => {
+                error!(?err, name, "the stored group can't be read or decoded");
+                Self::error_code(name, ErrorCode::UnknownServerError)
+            }
+            None => Self::found(name, GroupDetail::default()),
+        }
+    }
 }
 
 impl From<&NamedGroupDetail> for consumer_group_describe_response::DescribedGroup {
@@ -1289,7 +1354,7 @@ impl From<&NamedGroupDetail> for consumer_group_describe_response::DescribedGrou
                 .error_code((*error_code).into())
                 .error_message(Some(error_code.to_string()))
                 .group_id(name.into())
-                .group_state("Unknown".into())
+                .group_state(ConsumerGroupState::from(value).to_string())
                 .group_epoch(-1)
                 .assignment_epoch(-1)
                 .assignor_name("".into())
@@ -1338,12 +1403,33 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
             } => Self::default()
                 .error_code((*error_code).into())
                 .group_id(name.clone())
-                .group_state("Unknown".into())
+                .group_state(ConsumerGroupState::from(value).to_string())
                 .protocol_type("".into())
                 .protocol_data("".into())
                 .members(Some(vec![]))
                 .authorized_operations(Some(authorized_operations::OMITTED)),
         }
+    }
+}
+
+/// A group's state from its stored detail. A group whose detail the storage could not read is in
+/// the `Unknown` state.
+impl From<&NamedGroupDetail> for ConsumerGroupState {
+    fn from(value: &NamedGroupDetail) -> Self {
+        match &value.response {
+            GroupDetailResponse::Found(group_detail) => Self::from(group_detail),
+            GroupDetailResponse::ErrorCode(_) => Self::Unknown,
+        }
+    }
+}
+
+impl From<&NamedGroupDetail> for ListedGroup {
+    fn from(value: &NamedGroupDetail) -> Self {
+        Self::default()
+            .group_id(value.name.clone())
+            .protocol_type("consumer".into())
+            .group_state(Some(ConsumerGroupState::from(value).to_string()))
+            .group_type(Some("classic".into()))
     }
 }
 
@@ -1750,8 +1836,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
         keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult>;
 
-    /// Query available groups optionally with a state filter.
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>>;
+    /// Returns every group in this storage with its stored detail. A group without a stored
+    /// detail (e.g. a group with only committed offsets) has the default detail, which is empty.
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>>;
 
     /// Delete one or more groups from storage.
     async fn delete_groups(
@@ -2009,8 +2096,8 @@ where
         self.as_ref().describe_config(name, resource, keys).await
     }
 
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        self.as_ref().list_groups(states_filter).await
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
+        self.as_ref().list_groups().await
     }
 
     async fn delete_groups(
@@ -2283,8 +2370,8 @@ where
         self.as_ref().describe_config(name, resource, keys).await
     }
 
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        self.as_ref().list_groups(states_filter).await
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
+        self.as_ref().list_groups().await
     }
 
     async fn delete_groups(
@@ -2848,6 +2935,143 @@ mod tests {
         assert!(debug.contains("server_key: [hidden]"), "{debug}");
         assert!(debug.contains("salt-marker"), "{debug}");
         assert!(debug.contains("iterations: 4096"), "{debug}");
+    }
+
+    /// Returns a detail with one member, in the given group state and rebalance.
+    fn detail_with_one_member(state: GroupState, rebalance: GroupRebalance) -> GroupDetail {
+        GroupDetail {
+            members: [(
+                "member".into(),
+                GroupMember {
+                    join_response: JoinGroupResponseMember::default().member_id("member".into()),
+                    last_contact: None,
+                },
+            )]
+            .into(),
+            state,
+            rebalance: Box::new(rebalance),
+            ..GroupDetail::default()
+        }
+    }
+
+    /// Returns a forming group state with the `consumer` protocol type and `range` protocol.
+    fn forming_group_state(leader: Option<&str>) -> GroupState {
+        GroupState::Forming {
+            protocol_type: Some("consumer".into()),
+            protocol_name: Some("range".into()),
+            leader: leader.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn group_state_is_the_kafka_classic_group_state() {
+        let join_phase = JoinPhase {
+            deadline: SystemTime::now(),
+            joined: BTreeSet::new(),
+            initial_delay: None,
+        };
+
+        let formed = GroupState::Formed {
+            protocol_type: "consumer".into(),
+            protocol_name: "range".into(),
+            leader: "member".into(),
+            assignments: BTreeMap::new(),
+        };
+
+        let in_join_phase = GroupRebalance {
+            join_phase: Some(join_phase),
+            ..GroupRebalance::default()
+        };
+
+        let pending_sync = GroupRebalance {
+            pending_sync: Some(PendingSync {
+                deadline: SystemTime::now(),
+                members: ["member".into()].into(),
+            }),
+            ..GroupRebalance::default()
+        };
+
+        let without_members_in_join_phase = GroupDetail {
+            state: forming_group_state(None),
+            rebalance: Box::new(in_join_phase.clone()),
+            ..GroupDetail::default()
+        };
+
+        assert_eq!(
+            [
+                ConsumerGroupState::Empty,
+                ConsumerGroupState::PreparingRebalance,
+                ConsumerGroupState::PreparingRebalance,
+                ConsumerGroupState::CompletingRebalance,
+                ConsumerGroupState::PreparingRebalance,
+                ConsumerGroupState::Stable,
+            ],
+            [
+                GroupDetail::default(),
+                without_members_in_join_phase,
+                detail_with_one_member(forming_group_state(None), in_join_phase),
+                detail_with_one_member(forming_group_state(Some("member")), pending_sync),
+                detail_with_one_member(
+                    forming_group_state(Some("member")),
+                    GroupRebalance::default()
+                ),
+                detail_with_one_member(formed, GroupRebalance::default()),
+            ]
+            .each_ref()
+            .map(ConsumerGroupState::from)
+        );
+    }
+
+    #[test]
+    fn states_filter_ignores_case_and_surrounding_white_space() {
+        assert!(ConsumerGroupState::Stable.matches(Some(&[" stable ".into()])));
+    }
+
+    #[test]
+    fn states_filter_leaves_out_other_states() {
+        assert!(!ConsumerGroupState::Empty.matches(Some(&["Stable".into()])));
+    }
+
+    #[test]
+    fn states_filter_of_unknown_names_matches_no_state() {
+        assert!(!ConsumerGroupState::Empty.matches(Some(&["NoSuchState".into()])));
+    }
+
+    #[test]
+    fn missing_or_empty_states_filter_matches_every_state() {
+        assert_eq!(
+            (true, true),
+            (
+                ConsumerGroupState::Empty.matches(None),
+                ConsumerGroupState::Empty.matches(Some(&[]))
+            )
+        );
+    }
+
+    #[test]
+    fn storage_error_with_a_code_keeps_that_code() {
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            Error::Api(ErrorCode::UnknownServerError).group_request_error_code()
+        );
+    }
+
+    #[test]
+    fn other_storage_error_answers_coordinator_not_available() {
+        assert_eq!(
+            ErrorCode::CoordinatorNotAvailable,
+            Error::Message("connection refused".into()).group_request_error_code()
+        );
+    }
+
+    #[test]
+    fn group_that_storage_could_not_read_is_listed_as_unknown() {
+        let listed = ListedGroup::from(&NamedGroupDetail::error_code(
+            "group".into(),
+            ErrorCode::UnknownServerError,
+        ));
+
+        assert_eq!(Some("Unknown".into()), listed.group_state);
     }
 
     #[test]

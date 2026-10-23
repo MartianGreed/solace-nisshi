@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{
     StreamExt,
-    stream::{BoxStream, TryStreamExt},
+    stream::{self, BoxStream, TryStreamExt},
 };
 use metadata::Cache;
 use nisshi_sans_io::{
@@ -49,7 +49,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Record, deflated, inflated},
     to_system_time, to_timestamp,
@@ -149,6 +148,15 @@ const EMPTY_GROUP_SENTINEL: &str = "%empty";
 /// reports, the batch object's and the watermark document's, so the
 /// broker's clock does not enter into it.
 const BATCH_SETTLED_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// How many group state objects a `ListGroups` reads from the object store at once.
+///
+/// A listing that reads the objects one after another waits one round trip per group. A listing
+/// that reads them all at once opens a connection per group: with thousands of groups, it can use
+/// up the broker's file descriptors, which every other request also needs, or exceed the object
+/// store's request rate. The limit is a small bound between the two. Its value is not measured:
+/// any small bound gives most of the speed-up.
+const CONCURRENT_GROUP_STATE_READS: usize = 16;
 
 /// A backfill of one partition's time index in progress (see
 /// [`DynoStore::begin_time_index_backfill`]).
@@ -794,7 +802,7 @@ impl DynoStore {
 
         let mut deleted = self
             .object_store
-            .delete_stream(futures::stream::iter(expired).boxed());
+            .delete_stream(stream::iter(expired).boxed());
 
         while let Some(outcome) = deleted.next().await {
             if let Err(error) = outcome {
@@ -2949,7 +2957,7 @@ impl Storage for DynoStore {
         Ok(responses)
     }
 
-    async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         let location = self.group_consumers_prefix();
 
         // `list_with_delimiter` returns a group's committed offsets as a common prefix and its
@@ -2961,32 +2969,60 @@ impl Storage for DynoStore {
             .inspect(|list_result| debug!(?list_result))
             .inspect_err(|error| error!(?error, cluster = self.cluster))?;
 
-        let offsets_segments = list_result
-            .common_prefixes
-            .iter()
-            .filter_map(Path::filename);
-        let state_segments = list_result
+        // A group has a state object once a member joins it, and an offsets folder once it
+        // commits an offset. A group can have either one without the other.
+        let groups_with_state = list_result
             .objects
             .iter()
-            .filter_map(|object| object.location.filename()?.strip_suffix(".json"));
-
-        // The set holds each group that either list names. A group that has committed has both a
-        // common prefix and a state object, and the set keeps one entry for its id.
-        let group_ids = offsets_segments
-            .chain(state_segments)
-            .filter_map(decode_group_segment)
+            .filter_map(|object| {
+                object
+                    .location
+                    .filename()
+                    .and_then(|filename| filename.strip_suffix(".json"))
+                    .and_then(decode_group_segment)
+            })
             .collect::<BTreeSet<_>>();
 
-        Ok(group_ids
-            .into_iter()
-            .map(|group_id| {
-                ListedGroup::default()
-                    .group_id(group_id)
-                    .protocol_type("consumer".into())
-                    .group_state(Some("Unknown".into()))
-                    .group_type(Some("classic".into()))
+        let groups_with_offsets_only = list_result
+            .common_prefixes
+            .iter()
+            .filter_map(|prefix| {
+                prefix
+                    .parts()
+                    .next_back()
+                    .and_then(|segment| decode_group_segment(segment.as_ref()))
             })
-            .collect())
+            .filter(|group_id| !groups_with_state.contains(group_id))
+            .collect::<BTreeSet<_>>();
+
+        let mut listed_groups = groups_with_offsets_only
+            .into_iter()
+            .map(|group_id| NamedGroupDetail::found(group_id, GroupDetail::default()))
+            .collect::<Vec<_>>();
+
+        let stored_states = stream::iter(groups_with_state)
+            .map(|group_id| async move {
+                let stored = self.group_with_version(&group_id).await;
+                (group_id, stored)
+            })
+            .buffered(CONCURRENT_GROUP_STATE_READS)
+            .collect::<Vec<_>>()
+            .await;
+
+        listed_groups.extend(stored_states.into_iter().filter_map(
+            |(group_id, stored)| match stored {
+                Ok(Some((detail, _))) => Some(NamedGroupDetail::found(group_id, detail)),
+
+                // The group was deleted after the listing, so it is left out.
+                Ok(None) => None,
+
+                // A group whose state can't be read is listed in the `Unknown` state, so that
+                // one unreadable object does not hide every other group.
+                Err(err) => Some(NamedGroupDetail::decoded(group_id, Some(Err(err)))),
+            },
+        ));
+
+        Ok(listed_groups)
     }
 
     async fn delete_groups(
