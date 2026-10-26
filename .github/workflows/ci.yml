@@ -196,7 +196,6 @@ jobs:
       DATA_LAKE: s3://lake
       ICEBERG_CATALOG: http://localhost:8181/catalog
       ICEBERG_WAREHOUSE: nisshi
-      LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5@sha256:5b0475fff37e47fbef48f36ea2c91daf7035f04b38187b37a5f17639ecbe9cb4
       NEXTEST_PROFILE: ci
       POSTGRES_IMAGE: ${{matrix.pg}}
       PROMETHEUS_LISTENER_URL: tcp://[::]:9100
@@ -422,14 +421,12 @@ jobs:
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
-      LAKEKEEPER_IMAGE: unused
       # run.sh falls back to its pinned version when this is empty, and picks
       # the allowlist from the version
       LIBRDKAFKA_VERSION: ${{matrix.client.version}}
       POSTGRES_IMAGE: postgres:18
       RESULTS_FILE: results-${{matrix.storage.name}}${{matrix.client.suffix}}.csv
       STORAGE_ENGINE: ${{matrix.storage.engine}}
-      NISSHI_IMAGE: hello-world
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -512,11 +509,9 @@ jobs:
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
-      LAKEKEEPER_IMAGE: unused
       POSTGRES_IMAGE: postgres:18
       RESULTS_FILE: results-${{matrix.storage.name}}.csv
       STORAGE_ENGINE: ${{matrix.storage.engine}}
-      NISSHI_IMAGE: hello-world
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -625,6 +620,7 @@ jobs:
         with:
           tool: shellcheck@0.11.0
       - run: just shellcheck
+      - run: just compose-check
   third-party-license:
     if: needs.changes.outputs.rust == 'true'
     needs: [changes]
