@@ -476,10 +476,11 @@ jobs:
   # needed: a workflow_dispatch scans this workflow's `git_ref` input while
   # `github.ref_name` is main, which would file that ref's version as trunk's.
   #
-  # It grants `contents: read` and `id-token: write`, so any future
-  # `workflow_call` caller of this workflow must grant the latter too - a
-  # reusable workflow's permissions must be a subset of its caller's, enforced
-  # at run creation even though this job never runs on that path.
+  # It grants `contents: read` and `id-token: write`, so every `workflow_call`
+  # caller of this workflow (release-readiness-check.yaml, and release.yml
+  # above it) must grant the latter too - a reusable workflow's permissions
+  # must be a subset of its caller's, enforced at run creation even though
+  # this job never writes a row for a tag.
   update-manifest:
     name: Update release manifest
     needs: [setup, gate, manifest-tip]
