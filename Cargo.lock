@@ -6328,6 +6328,7 @@ dependencies = [
  "slatedb",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]
