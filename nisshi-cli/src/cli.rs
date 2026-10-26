@@ -105,7 +105,7 @@ pub struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 enum Command {
-    /// Apache Kafka compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
+    /// Apache Kafka®-compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
     Broker(Box<broker::Arg>),
 
     /// Easily consume or produce Avro, JSON or Protobuf messages to a topic
@@ -120,7 +120,7 @@ enum Command {
     /// Performance
     Perf(Box<perf::Arg>),
 
-    /// Apache Kafka compatible proxy
+    /// Apache Kafka®-compatible proxy
     Proxy(Box<proxy::Arg>),
 
     /// Create, list or delete topics managed by the broker
