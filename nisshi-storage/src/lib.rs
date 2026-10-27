@@ -1776,6 +1776,12 @@ pub trait Storage: Debug + Send + Sync + 'static {
 
     /// Fetch deflated batches from storage.
     ///
+    /// The batches hold at most `max_bytes`, except that a read can exceed it by
+    /// one batch. A read returns the first batch at or after `offset` even when
+    /// that batch alone is larger than `max_bytes`, so that a consumer gets past
+    /// it (KIP-74). The fetch service relies on this: without it, a consumer
+    /// whose fetch limit is smaller than a record never reads past that record.
+    ///
     /// For a topic or partition that does not exist, see
     /// [`Storage::offset_stage`].
     async fn fetch(
