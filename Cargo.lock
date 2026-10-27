@@ -6241,6 +6241,7 @@ dependencies = [
  "nisshi-client",
  "nisshi-sans-io",
  "rand 0.10.3",
+ "rcgen",
  "serde",
  "serde_json",
  "tokio",

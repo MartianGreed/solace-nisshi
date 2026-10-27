@@ -28,6 +28,7 @@ mod kafka_cli;
 mod postgres_server;
 pub mod settings;
 mod storage_url;
+mod tls_certificate;
 
 pub use broker::{Broker, FREQUENT_MAINTENANCE, LaunchOptions};
 pub use broker_state_reader::BrokerStateReader;
@@ -50,6 +51,7 @@ pub use kafka_cli::{
 };
 pub use postgres_server::PostgresServer;
 pub use storage_url::StorageUrl;
+pub use tls_certificate::TlsCertificate;
 
 /// The cluster id of the broker that all tests share.
 pub const SHARED_CLUSTER_ID: &str = "nisshi-smoke";
