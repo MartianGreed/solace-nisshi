@@ -39,7 +39,7 @@ use futures::pin_mut;
 use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
-    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
+    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism, TimestampType,
     add_partitions_to_txn_response::{
         AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
     },
@@ -103,7 +103,8 @@ use uuid::Uuid;
 use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        consumer_group_select, default_hash, idempotent_sequence_check, watermark_select_for_write,
+        consumer_group_select, default_hash, idempotent_sequence_check, topic_configuration_select,
+        topic_configuration_select_keys, topic_select, watermark_select_for_write,
     },
 };
 
@@ -931,6 +932,21 @@ impl TryFrom<Row> for Txn {
     }
 }
 
+/// Returns the `DescribeConfigs` entry for a config that a topic sets: a dynamic topic config of
+/// type `STRING`. A null stored value is described as an empty string.
+fn dynamic_topic_config(name: String, value: Option<String>) -> DescribeConfigsResourceResult {
+    DescribeConfigsResourceResult::default()
+        .name(name)
+        .value(Some(value.unwrap_or_default()))
+        .read_only(false)
+        .is_default(None)
+        .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
+        .is_sensitive(false)
+        .synonyms(Some([].into()))
+        .config_type(Some(ConfigType::String.into()))
+        .documentation(Some("".into()))
+}
+
 impl Postgres {
     /// Applies every change in `resource` to its topic in one transaction, so
     /// that a failed change leaves the topic's configuration unchanged.
@@ -1223,11 +1239,29 @@ impl Postgres {
                     .map(|producer_epoch| producer_epoch.unwrap_or(-1))
                     .inspect_err(|err| error!(?err))?;
 
+                let timestamp = record
+                    .try_get::<_, SystemTime>(2)
+                    .map_err(Error::from)
+                    .and_then(|system_time| to_timestamp(&system_time).map_err(Into::into))
+                    .inspect(|timestamp| debug!(?timestamp))
+                    .inspect_err(|err| error!(?err))?;
+
+                // A `LogAppendTime` record whose timestamp differs from the batch's starts a new
+                // batch. A consumer reads one timestamp, `max_timestamp`, for every record of a
+                // `LogAppendTime` batch. Each stored record holds the broker's time of its own
+                // produce request, so one batch cannot hold two such times.
                 if batch_builder.attributes != attributes
                     || batch_builder.producer_id != producer_id
                     || batch_builder.producer_epoch != producer_epoch
+                    || (TimestampType::from(attributes) == TimestampType::LogAppendTime
+                        && timestamp != batch_builder.base_timestamp)
                 {
-                    batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+                    batches.push(
+                        batch_builder
+                            .max_timestamp_of_records()
+                            .build()
+                            .and_then(TryInto::try_into)?,
+                    );
 
                     batch_builder = Batch::builder()
                         .base_offset(
@@ -1236,15 +1270,7 @@ impl Postgres {
                                 .inspect(|base_offset| debug!(base_offset))
                                 .inspect_err(|err| error!(?err))?,
                         )
-                        .base_timestamp(
-                            record
-                                .try_get::<_, SystemTime>(2)
-                                .map_err(Error::from)
-                                .and_then(|system_time| {
-                                    to_timestamp(&system_time).map_err(Into::into)
-                                })
-                                .inspect_err(|err| error!(?err))?,
-                        )
+                        .base_timestamp(timestamp)
                         .attributes(attributes)
                         .producer_id(producer_id)
                         .producer_epoch(producer_epoch);
@@ -1257,16 +1283,7 @@ impl Postgres {
 
                 let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
 
-                let timestamp_delta = record
-                    .try_get::<_, SystemTime>(2)
-                    .map_err(Error::from)
-                    .and_then(|system_time| {
-                        to_timestamp(&system_time)
-                            .map(|timestamp| timestamp - batch_builder.base_timestamp)
-                            .map_err(Into::into)
-                    })
-                    .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?;
+                let timestamp_delta = timestamp - batch_builder.base_timestamp;
 
                 let k = record
                     .try_get::<_, Option<&[u8]>>(3)
@@ -1315,7 +1332,12 @@ impl Postgres {
                 }
             }
 
-            batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+            batches.push(
+                batch_builder
+                    .max_timestamp_of_records()
+                    .build()
+                    .and_then(TryInto::try_into)?,
+            );
         } else {
             batches.push(Batch::builder().build().and_then(TryInto::try_into)?);
         }
@@ -1875,6 +1897,88 @@ impl Postgres {
             .map_err(Into::into)
     }
 
+    /// Returns the configs among `keys` that the topic `name` sets, or `None` when the topic does
+    /// not exist.
+    async fn topic_configs_by_key(
+        &self,
+        c: &Object,
+        name: &str,
+        keys: &[String],
+    ) -> Result<Option<Vec<DescribeConfigsResourceResult>>> {
+        // This function runs one query instead of the two that `all_topic_configs` runs, because
+        // the broker reads `message.timestamp.type` through here for each topic of each produce
+        // request.
+        let rows = self
+            .prepare_query(
+                c,
+                topic_configuration_select_keys::QUERY,
+                &[&self.cluster.as_str(), &name, &keys],
+            )
+            .await?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let mut configs = vec![];
+
+        for row in rows {
+            // The query returns a row with a null name for a topic that sets none of `keys`, and
+            // that row is not a config.
+            let Some(name) = row
+                .try_get::<_, Option<String>>(topic_configuration_select_keys::NAME)
+                .inspect_err(|err| error!(?err))?
+            else {
+                continue;
+            };
+            let value = row
+                .try_get::<_, Option<String>>(topic_configuration_select_keys::VALUE)
+                .inspect_err(|err| error!(?err))?;
+
+            configs.push(dynamic_topic_config(name, value));
+        }
+
+        Ok(Some(configs))
+    }
+
+    /// Returns every config that the topic `name` sets, or `None` when the topic does not exist.
+    async fn all_topic_configs(
+        &self,
+        c: &Object,
+        name: &str,
+    ) -> Result<Option<Vec<DescribeConfigsResourceResult>>> {
+        if self
+            .prepare_query(c, topic_select::QUERY, &[&self.cluster.as_str(), &name])
+            .await?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+
+        let rows = self
+            .prepare_query(
+                c,
+                topic_configuration_select::QUERY,
+                &[&self.cluster.as_str(), &name],
+            )
+            .await?;
+
+        let mut configs = vec![];
+
+        for row in rows {
+            let name = row
+                .try_get::<_, String>(topic_configuration_select::NAME)
+                .inspect_err(|err| error!(?err))?;
+            let value = row
+                .try_get::<_, Option<String>>(topic_configuration_select::VALUE)
+                .inspect_err(|err| error!(?err))?;
+
+            configs.push(dynamic_topic_config(name, value));
+        }
+
+        Ok(Some(configs))
+    }
+
     #[instrument(skip(self, c, params))]
     async fn prepare_query(
         &self,
@@ -2305,7 +2409,7 @@ impl Postgres {
 
                     let producer_id = transaction_id.and(Some(inflated.producer_id));
                     let producer_epoch = transaction_id.and(Some(inflated.producer_epoch));
-                    let ts = to_system_time(inflated.base_timestamp + record.timestamp_delta)?;
+                    let ts = to_system_time(inflated.record_timestamp(record))?;
 
                     let mut row: Vec<&(dyn ToSql + Sync)> =
                         Vec::with_capacity(record_column_types.len());
@@ -4216,52 +4320,12 @@ impl Storage for Postgres {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        let prepared = c
-            .prepare_cached(self.sql_lookup("topic_select.sql")?)
-            .await
-            .inspect_err(|err| error!(?err))?;
+        let configs = match keys.filter(|keys| !keys.is_empty()) {
+            Some(keys) => self.topic_configs_by_key(&c, name, keys).await?,
+            None => self.all_topic_configs(&c, name).await?,
+        };
 
-        if c.query_opt(&prepared, &[&self.cluster.as_str(), &name])
-            .await
-            .inspect_err(|err| error!(?err))?
-            .is_some()
-        {
-            let prepared = c
-                .prepare_cached(self.sql_lookup("topic_configuration_select.sql")?)
-                .await
-                .inspect_err(|err| error!(?err))?;
-
-            let rows = c
-                .query(&prepared, &[&self.cluster.as_str(), &name])
-                .await
-                .inspect_err(|err| error!(?err))?;
-
-            let mut configs = vec![];
-
-            for row in rows {
-                let name = row
-                    .try_get::<_, String>(0)
-                    .inspect_err(|err| error!(?err))?;
-                let value = row
-                    .try_get::<_, Option<String>>(1)
-                    .map(|value| value.unwrap_or_default())
-                    .map(Some)
-                    .inspect_err(|err| error!(?err))?;
-
-                configs.push(
-                    DescribeConfigsResourceResult::default()
-                        .name(name)
-                        .value(value)
-                        .read_only(false)
-                        .is_default(None)
-                        .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
-                        .is_sensitive(false)
-                        .synonyms(Some([].into()))
-                        .config_type(Some(ConfigType::String.into()))
-                        .documentation(Some("".into())),
-                );
-            }
-
+        if let Some(configs) = configs {
             let error_code = ErrorCode::None;
 
             Ok(DescribeConfigsResult::default()
