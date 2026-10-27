@@ -26,7 +26,8 @@
 #   GITHUB_OUTPUT       file the outputs are appended to
 #
 # Run with the working directory set to the checkout the scan jobs will use: the
-# commit it is at becomes the `sha` output, which every later job checks out. The
+# commit it is at becomes the `sha` output, which every later job checks out. A
+# trunk run needs `origin/main` in that checkout. The
 # script itself must come from the workflow's own commit, not from that checkout
 # (see `setup` in the workflow), or a scanned branch could classify itself as trunk.
 #
@@ -98,6 +99,15 @@ fi
 SHA="$(git rev-parse HEAD)"
 if ! [[ "$SHA" =~ $SHA_RE ]]; then
   echo "::error::checked-out commit '$SHA' is not a 40-character SHA" >&2
+  exit 1
+fi
+
+# A trunk run scans only a commit that is on main. Every trunk job runs in
+# `guardian-trunk` and runs tools that execute code from the scanned tree, so
+# the run stops here, before any of them starts. A release tag passes because
+# release.yml's `on-main` job requires the tagged commit to be on main.
+if [ "$MODE" = "trunk" ] && ! git merge-base --is-ancestor "$SHA" origin/main; then
+  echo "::error::$SHA is not on main, so it does not run as trunk" >&2
   exit 1
 fi
 

@@ -35,6 +35,9 @@ g commit -q --allow-empty -m second
 g tag tansu-9
 g tag 0.5.0
 SHA=$(g rev-parse HEAD)
+# The script requires a trunk commit to be on main. HEAD is main's tip here,
+# except in Case 10.
+g update-ref refs/remotes/origin/main HEAD
 DESCRIBED="v1.0.0-1-g${SHA:0:7}"
 
 pass_count=0
@@ -205,6 +208,21 @@ run_fails EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1 \
     GITHUB_REF=refs/heads/main GIT_REF_INPUT='x";$(id)' IS_FORK=false
 run_fails EVENT_NAME=pull_request HEAD_SHA=abc FULL_VERSION_INPUT=v1 \
     GITHUB_REF=refs/pull/7/merge IS_FORK=false
+
+# --- Case 10: a trunk run requires a commit on main ----------------------------
+# Only trunk runs in `guardian-trunk`, so only trunk checks. Main's tip passes
+# (every trunk case above), a commit off main fails, and so does a checkout
+# without `origin/main`. A branch run of the same commit still resolves.
+g update-ref refs/remotes/origin/main HEAD~1
+run_fails EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1 \
+    GITHUB_REF=refs/heads/main GIT_REF_INPUT=refs/tags/v1.2.3 IS_FORK=false
+run_fails EVENT_NAME=push FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main IS_FORK=false
+run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1 \
+    GITHUB_REF=refs/heads/main GIT_REF_INPUT=refs/heads/feature/x IS_FORK=false
+check "off-main-branch" branch refs/heads/feature/x feature/x v1 v1 false false false false false true false REPORT
+g update-ref -d refs/remotes/origin/main
+run_fails EVENT_NAME=push FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main IS_FORK=false
+g update-ref refs/remotes/origin/main HEAD
 
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]
