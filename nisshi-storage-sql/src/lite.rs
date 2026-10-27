@@ -16,7 +16,8 @@ use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        Cache, consumer_group_select, default_hash, idempotent_sequence_check, remove_comments,
+        Cache, consumer_group_select, default_hash, idempotent_epoch_check,
+        idempotent_sequence_check, producer_epochs_select, remove_comments,
         result_columns::ResultColumns, watermark_select_for_write,
     },
 };
@@ -60,12 +61,12 @@ use nisshi_schema::{
 use nisshi_storage::{
     ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer,
     DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    RequestChannelService, RequestStorageService, Result, ScramCredential, SemaphoreProxy,
-    StartupFailure, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, bounded_channel, check_claim,
-    config::apply_op, delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes,
-    producer_claim,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch,
+    ProducerIdResponse, RequestChannelService, RequestStorageService, Result, ScramCredential,
+    SemaphoreProxy, StartupFailure, Storage, StoredEpochs, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, bounded_channel, check_claim, config::apply_op, delete_records_cutoff,
+    epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -646,23 +647,58 @@ impl Delegate {
     #[instrument(skip_all)]
     async fn idempotent_message_check(
         &self,
-        _transaction_id: Option<&str>,
+        transaction_id: Option<&str>,
         topition: &Topition,
         deflated: &deflated::Batch,
         connection: &PoolConnection,
     ) -> Result<()> {
         let mut rows = connection
             .query(
-                "producer_epoch_current_for_producer.sql",
-                (self.cluster.as_str(), deflated.producer_id),
+                producer_epochs_select::QUERY,
+                (
+                    self.cluster.as_str(),
+                    deflated.producer_id,
+                    topition.topic(),
+                    topition.partition(),
+                ),
             )
             .await?;
 
+        let columns = ResultColumns::libsql(producer_epochs_select::QUERY, &rows);
+        let newest_epoch = columns.index(producer_epochs_select::NEWEST_EPOCH)? as i32;
+        let partition_epoch = columns.index(producer_epochs_select::PARTITION_EPOCH)? as i32;
+        let transactional = columns.index(producer_epochs_select::TRANSACTIONAL)? as i32;
+
         if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
-            let current_epoch = i16::try_from(
-                row.get::<i32>(0)
-                    .inspect_err(|err| error!(self.cluster, deflated.producer_id, ?err))?,
-            )?;
+            let stored = StoredEpochs {
+                transactional: row
+                    .get::<i32>(transactional)
+                    .inspect_err(|err| error!(?err))?
+                    != 0,
+                newest: i16::try_from(
+                    row.get::<i32>(newest_epoch)
+                        .inspect_err(|err| error!(?err))?,
+                )?,
+                partition: row
+                    .get::<Option<i32>>(partition_epoch)
+                    .inspect_err(|err| error!(?err))?
+                    .map(i16::try_from)
+                    .transpose()?,
+            };
+
+            if idempotent_epoch_check(transaction_id, stored, deflated)? == ProduceEpoch::Start {
+                _ = connection
+                    .execute(
+                        "producer_epoch_insert_given.sql",
+                        (
+                            self.cluster.as_str(),
+                            deflated.producer_id,
+                            deflated.producer_epoch,
+                        ),
+                    )
+                    .await
+                    .inspect_err(|err| error!(?err))?;
+            }
 
             let row = connection
                 .query_one(
@@ -693,11 +729,11 @@ impl Delegate {
                 ?topition,
                 deflated.producer_id,
                 deflated.producer_epoch,
-                current_epoch,
+                ?stored,
                 sequence,
             );
 
-            let increment = idempotent_sequence_check(&current_epoch, &sequence, deflated)?;
+            let increment = idempotent_sequence_check(sequence, deflated)?;
 
             debug!(increment);
 

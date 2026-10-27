@@ -1171,6 +1171,8 @@ where
 
         let tp = Topition::new(name, partition.index);
         let producer_id = batch.producer_id;
+        let producer_epoch = batch.producer_epoch;
+        let base_sequence = batch.base_sequence;
 
         match self.storage.produce(transaction_id, &tp, batch).await {
             Ok(base_offset) => PartitionProduceResponse::default()
@@ -1194,6 +1196,8 @@ where
                         topic = name,
                         partition = partition.index,
                         producer_id,
+                        producer_epoch,
+                        base_sequence,
                         ?error,
                         "produce failed"
                     );
@@ -1211,6 +1215,8 @@ where
                         topic = name,
                         partition = partition.index,
                         producer_id,
+                        producer_epoch,
+                        base_sequence,
                         ?error_code,
                         %error,
                         "rejecting produce batch"

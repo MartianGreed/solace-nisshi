@@ -88,6 +88,11 @@ a transactional producer fails at `initTransactions()` with
 TransactionalIdAuthorizationException. The broker still advertises the other transaction APIs,
 but a client cannot start a transaction to use them.
 
+An idempotent producer can bump its own epoch after an error and restart its sequence at 0
+(KIP-360), and the broker keeps the epoch for each partition, as Kafka does. A batch at an epoch
+older than its partition's gets PRODUCER_FENCED, where Kafka answers INVALID_PRODUCER_EPOCH. The
+broker refuses a bump to epoch 32766 or above with PRODUCER_FENCED, and Kafka accepts it.
+
 | API | Key | Versions | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --: | --- | --- | --- | --- | --- | --- |
 | InitProducerId | 22 | 0-5 | Partial | Partial | Partial | Partial | Gives a producer ID to an idempotent producer. Refuses a request with a `transactional.id`. |

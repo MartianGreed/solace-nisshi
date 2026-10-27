@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub(crate) mod consumer_group_select;
+pub(crate) mod producer_epochs_select;
 #[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) mod result_columns;
 pub(crate) mod topic_configuration_select;
@@ -21,7 +22,7 @@ pub(crate) mod topic_select;
 pub(crate) mod watermark_select_for_write;
 
 use nisshi_sans_io::{ErrorCode, record::deflated};
-use nisshi_storage::{Error, Result};
+use nisshi_storage::{Error, ProduceEpoch, Result, StoredEpochs};
 use std::{
     cmp::Ordering,
     hash::{DefaultHasher, Hash, Hasher as _},
@@ -220,6 +221,14 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
         (
             "producer_epoch_insert.sql",
             include_sql!("sql/producer_epoch_insert.sql"),
+        ),
+        (
+            "producer_epoch_insert_given.sql",
+            include_sql!("sql/producer_epoch_insert_given.sql"),
+        ),
+        (
+            producer_epochs_select::QUERY,
+            include_sql!("sql/producer_epochs_select.sql"),
         ),
         (
             "producer_insert.sql",
@@ -525,29 +534,44 @@ pub(crate) fn remove_comments(commented: &str) -> String {
     })
 }
 
-pub(crate) fn idempotent_sequence_check(
-    producer_epoch: &i16,
-    sequence: &i32,
+/// Checks a batch's epoch against the epochs stored for its producer, read with
+/// [`producer_epochs_select`]. The batch's producer is transactional when `stored` says so,
+/// when the request has a transactional ID, or when the batch is transactional.
+pub(crate) fn idempotent_epoch_check(
+    transaction_id: Option<&str>,
+    stored: StoredEpochs,
     deflated: &deflated::Batch,
-) -> Result<i32> {
-    match producer_epoch.cmp(&deflated.producer_epoch) {
-        Ordering::Equal => match sequence.cmp(&deflated.base_sequence) {
-            Ordering::Equal => Ok(deflated.last_offset_delta + 1),
+) -> Result<ProduceEpoch> {
+    let stored = StoredEpochs {
+        transactional: stored.transactional
+            || transaction_id.is_some()
+            || deflated.is_transactional(),
+        ..stored
+    };
 
-            Ordering::Greater => {
-                debug!(?sequence, ?deflated.base_sequence);
-                Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
-            }
+    stored
+        .check_batch(deflated.producer_epoch, deflated.base_sequence)
+        .inspect_err(|error| debug!(?error, ?stored, deflated.producer_epoch))
+        .map_err(Error::Api)
+}
 
-            Ordering::Less => {
-                debug!(?sequence, ?deflated.base_sequence);
-                Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
-            }
-        },
+/// Checks a batch's first sequence against `sequence`, the next sequence stored for its
+/// producer's epoch on the partition, and returns how far the batch advances it.
+///
+/// The caller checks the batch's epoch first, with [`idempotent_epoch_check`].
+pub(crate) fn idempotent_sequence_check(sequence: i32, deflated: &deflated::Batch) -> Result<i32> {
+    match sequence.cmp(&deflated.base_sequence) {
+        Ordering::Equal => Ok(deflated.last_offset_delta + 1),
 
-        Ordering::Greater => Err(Error::Api(ErrorCode::ProducerFenced)),
+        Ordering::Greater => {
+            debug!(?sequence, ?deflated.base_sequence);
+            Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
+        }
 
-        Ordering::Less => Err(Error::Api(ErrorCode::InvalidProducerEpoch)),
+        Ordering::Less => {
+            debug!(?sequence, ?deflated.base_sequence);
+            Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
+        }
     }
 }
 

@@ -62,10 +62,10 @@ use nisshi_schema::{
 use nisshi_storage::{
     BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
-    inflate_produced, max_message_bytes, offload, producer_claim,
+    OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    TxnState, UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff,
+    epoch_is_exhausted, inflate_produced, max_message_bytes, offload, producer_claim,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -268,6 +268,13 @@ impl OptiCon<Meta> {
 }
 
 impl Meta {
+    /// Whether a transactional ID owns the producer ID.
+    fn transactional_id_owns(&self, producer_id: ProducerId) -> bool {
+        self.transactions
+            .values()
+            .any(|txn| txn.producer == producer_id)
+    }
+
     fn produced(
         &self,
         transaction_id: &str,
@@ -405,6 +412,67 @@ impl Meta {
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct ProducerDetail {
     sequences: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, Sequence>>>,
+}
+
+impl ProducerDetail {
+    /// Returns the epochs that a batch from this producer to `topition` is checked against.
+    fn stored_epochs(&self, transactional: bool, topition: &Topition) -> Option<StoredEpochs> {
+        let newest = *self.sequences.keys().next_back()?;
+
+        let partition = self
+            .sequences
+            .iter()
+            .rev()
+            .find(|(_, topics)| {
+                topics
+                    .get(&topition.topic)
+                    .is_some_and(|partitions| partitions.contains_key(&topition.partition))
+            })
+            .map(|(epoch, _)| *epoch);
+
+        Some(StoredEpochs {
+            transactional,
+            newest,
+            partition,
+        })
+    }
+
+    /// Returns the next sequence of `topition` at `epoch`, after the producer starts that
+    /// epoch on the partition.
+    ///
+    /// Starting an epoch removes the partition's sequences at older epochs, and each older
+    /// epoch that then holds none. A produce never reads them again, and keeping them would
+    /// grow meta.json, which every idempotent produce rewrites, by an entry for each bump.
+    fn start_epoch(&mut self, epoch: ProducerEpoch, topition: &Topition) -> &mut Sequence {
+        self.sequences.retain(|older, topics| {
+            if *older >= epoch {
+                return true;
+            }
+
+            if let Some(partitions) = topics.get_mut(&topition.topic) {
+                _ = partitions.remove(&topition.partition);
+
+                if partitions.is_empty() {
+                    _ = topics.remove(&topition.topic);
+                }
+            }
+
+            !topics.is_empty()
+        });
+
+        self.sequence(epoch, topition)
+    }
+
+    /// Returns the next sequence of `topition` at `epoch`, 0 when the partition has none.
+    fn sequence(&mut self, epoch: ProducerEpoch, topition: &Topition) -> &mut Sequence {
+        self.sequences
+            .entry(epoch)
+            .or_default()
+            .entry(topition.topic.clone())
+            .or_default()
+            .entry(topition.partition)
+            .or_default()
+    }
 }
 
 /// Allocates a new producer ID, one more than the newest, and gives it epoch 0.
@@ -2018,6 +2086,8 @@ impl Storage for DynoStore {
                 None
             };
 
+            let transactional = transaction_id.is_some() || deflated.is_transactional();
+
             // Idempotent sequence numbers are checked here but only
             // *advanced* after the record write below succeeds (see the
             // second check further down). Checking first, without
@@ -2035,21 +2105,31 @@ impl Storage for DynoStore {
                             return Err(Error::Api(ErrorCode::UnknownProducerId));
                         };
 
-                        let Some((current_epoch, sequences)) = pd.sequences.last_key_value() else {
-                            debug!(last_entry = ?pd.sequences.last_key_value());
+                        let Some(stored) = pd.stored_epochs(
+                            transactional || meta.transactional_id_owns(deflated.producer_id),
+                            topition,
+                        ) else {
+                            debug!(producer_id = deflated.producer_id, "no epoch");
                             return Err(Error::Api(ErrorCode::UnknownServerError));
                         };
 
-                        if current_epoch != &deflated.producer_epoch {
-                            debug!(?current_epoch, producer_epoch = deflated.producer_epoch);
-                            return Err(Error::Api(ErrorCode::ProducerFenced));
-                        }
+                        let sequence = match stored
+                            .check_batch(deflated.producer_epoch, deflated.base_sequence)
+                            .inspect_err(|error| {
+                                debug!(?error, ?stored, producer_epoch = deflated.producer_epoch)
+                            })
+                            .map_err(Error::Api)?
+                        {
+                            ProduceEpoch::Continue => pd
+                                .sequences
+                                .get(&deflated.producer_epoch)
+                                .and_then(|topics| topics.get(&topition.topic))
+                                .and_then(|partitions| partitions.get(&topition.partition))
+                                .copied()
+                                .unwrap_or_default(),
 
-                        let sequence = sequences
-                            .get(&topition.topic)
-                            .and_then(|partitions| partitions.get(&topition.partition))
-                            .copied()
-                            .unwrap_or_default();
+                            ProduceEpoch::Start => 0,
+                        };
 
                         match sequence {
                             sequence if sequence < deflated.base_sequence => {
@@ -2224,30 +2304,31 @@ impl Storage for DynoStore {
             if is_idempotent {
                 self.meta
                     .with_mut(&self.object_store, |meta| {
+                        let transactional =
+                            transactional || meta.transactional_id_owns(producer_id);
+
                         let Some(pd) = meta.producers.get_mut(&producer_id) else {
                             debug!(producer_id, ?meta.producers);
                             return Err(Error::Api(ErrorCode::UnknownProducerId));
                         };
 
-                        let Some(mut current) = pd.sequences.last_entry() else {
-                            debug!(last_entry = ?pd.sequences.last_entry());
+                        let Some(stored) = pd.stored_epochs(transactional, topition) else {
+                            debug!(producer_id, "no epoch");
                             return Err(Error::Api(ErrorCode::UnknownServerError));
                         };
 
-                        if current.key() != &producer_epoch {
-                            debug!(current = ?current.key(), producer_epoch);
-                            return Err(Error::Api(ErrorCode::ProducerFenced));
-                        }
-
-                        let sequences = current.get_mut();
-                        debug!(?sequences);
-
-                        match sequences
-                            .entry(topition.topic.clone())
-                            .or_default()
-                            .entry(topition.partition)
-                            .or_default()
+                        // with_mut stores each change that this closure makes, also when it
+                        // then answers an error, so the epoch is checked before any change.
+                        let sequence = match stored
+                            .check_batch(producer_epoch, base_sequence)
+                            .inspect_err(|error| debug!(?error, ?stored, producer_epoch))
+                            .map_err(Error::Api)?
                         {
+                            ProduceEpoch::Continue => pd.sequence(producer_epoch, topition),
+                            ProduceEpoch::Start => pd.start_epoch(producer_epoch, topition),
+                        };
+
+                        match sequence {
                             sequence if *sequence < base_sequence => {
                                 debug!(?sequence, base_sequence);
 

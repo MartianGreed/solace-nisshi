@@ -67,9 +67,9 @@ use nisshi_schema::{
 use nisshi_storage::{
     BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, check_claim, config::apply_op, deadline, delete_records_cutoff,
+    OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    TxnState, UpdateError, Version, check_claim, config::apply_op, deadline, delete_records_cutoff,
     epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
 };
 use opentelemetry::metrics::Histogram;
@@ -103,8 +103,9 @@ use uuid::Uuid;
 use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        consumer_group_select, default_hash, idempotent_sequence_check, topic_configuration_select,
-        topic_configuration_select_keys, topic_select, watermark_select_for_write,
+        consumer_group_select, default_hash, idempotent_epoch_check, idempotent_sequence_check,
+        producer_epochs_select, topic_configuration_select, topic_configuration_select_keys,
+        topic_select, watermark_select_for_write,
     },
 };
 
@@ -1636,15 +1637,44 @@ impl Postgres {
         if let Some(row) = self
             .tx_prepare_query_opt(
                 tx,
-                "producer_epoch_current_for_producer.sql",
-                &[&self.cluster, &deflated.producer_id],
+                producer_epochs_select::QUERY,
+                &[
+                    &self.cluster,
+                    &deflated.producer_id,
+                    &topition.topic(),
+                    &topition.partition(),
+                ],
             )
             .await
             .inspect_err(|err| error!(?err))?
         {
-            let current_epoch = row
-                .try_get::<_, i16>(0)
-                .inspect_err(|err| error!(self.cluster, deflated.producer_id, ?err))?;
+            let stored = StoredEpochs {
+                transactional: row
+                    .try_get::<_, i32>(producer_epochs_select::TRANSACTIONAL)
+                    .inspect_err(|err| error!(?err))?
+                    != 0,
+                newest: row
+                    .try_get(producer_epochs_select::NEWEST_EPOCH)
+                    .inspect_err(|err| error!(?err))?,
+                partition: row
+                    .try_get(producer_epochs_select::PARTITION_EPOCH)
+                    .inspect_err(|err| error!(?err))?,
+            };
+
+            if idempotent_epoch_check(transaction_id, stored, deflated)? == ProduceEpoch::Start {
+                _ = self
+                    .tx_prepare_execute(
+                        tx,
+                        "producer_epoch_insert_given.sql",
+                        &[
+                            &self.cluster,
+                            &deflated.producer_id,
+                            &deflated.producer_epoch,
+                        ],
+                    )
+                    .await
+                    .inspect_err(|err| error!(?err))?;
+            }
 
             let row = self
                 .tx_prepare_query_one(
@@ -1676,11 +1706,11 @@ impl Postgres {
                 ?topition,
                 deflated.producer_id,
                 deflated.producer_epoch,
-                current_epoch,
+                ?stored,
                 sequence,
             );
 
-            let increment = idempotent_sequence_check(&current_epoch, &sequence, deflated)?;
+            let increment = idempotent_sequence_check(sequence, deflated)?;
 
             debug!(increment);
 
@@ -2636,7 +2666,7 @@ impl Postgres {
         // clean up this transaction's own bookkeeping: the producer might still be alive
         // and about to send more data under this same epoch. Bump it now, before doing any
         // of the actual abort work below (which can be deferred behind an older still-open
-        // transaction) -- idempotent_sequence_check already rejects a stale epoch with
+        // transaction) -- check_produce_epoch already rejects a stale epoch with
         // ProducerFenced, this just needs to make the current one stale. Only on the first
         // call that actually touches this transaction (write_marker), not a matching retry.
         //
