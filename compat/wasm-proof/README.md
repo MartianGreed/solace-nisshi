@@ -51,7 +51,7 @@ It fails when `BOOTSTRAP_SERVERS` is missing. It does not skip broker checks.
 ## Run the guest separately
 
 ```sh
-RUSTFLAGS='--cfg tokio_unstable' cargo build --locked -p nisshi-wasi --target wasm32-wasip2
+RUSTFLAGS='--cfg tokio_unstable' cargo build --locked -p nisshi-wasi --target wasm32-wasip2 --target-dir target
 wasmtime run -S inherit-network=y -S udp=n \
   target/wasm32-wasip2/debug/nisshi-wasi.wasm 127.0.0.1:19092
 ```
