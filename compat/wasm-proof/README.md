@@ -28,6 +28,10 @@ to choose another port. The script builds with the lockfile, checks startup
 without a network grant, starts the guest, runs the client checks, stops the
 guest, and requires the client check to fail afterward. It removes only its
 own broker process. Logs remain in the printed `target/wasm-proof.*` directory.
+The script builds into this checkout's `target/` directory, overriding
+`CARGO_TARGET_DIR` and Cargo's `build.target-dir` setting so it tests the artifact
+it just built. Cargo creates the directory and its cache marker before the
+script creates the evidence directory.
 
 The client checks:
 

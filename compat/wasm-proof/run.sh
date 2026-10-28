@@ -5,7 +5,7 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 : "${WASI_SDK_PATH:?Set WASI_SDK_PATH to an extracted WASI SDK 34 directory}"
 address=${WASI_BROKER_ADDRESS:-127.0.0.1:19092}
-mkdir -p "$root/target"
+RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg tokio_unstable" cargo build --locked -p nisshi-wasi --target wasm32-wasip2 --target-dir "$root/target"
 run_directory=$(mktemp -d "$root/target/wasm-proof.XXXXXX")
 broker_pid=
 cleanup() {
@@ -16,7 +16,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg tokio_unstable" cargo build --locked -p nisshi-wasi --target wasm32-wasip2
 artifact="$root/target/wasm32-wasip2/debug/nisshi-wasi.wasm"
 wasmtime --version
 rustc --version
