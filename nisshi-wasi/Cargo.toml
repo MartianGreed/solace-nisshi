@@ -1,0 +1,24 @@
+[package]
+name = "nisshi-wasi"
+description = "Experimental WASI p2 launcher for the Nisshi in-memory broker"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+nisshi-broker = { workspace = true, features = ["dynostore"] }
+nisshi-sans-io.workspace = true
+nisshi-service.workspace = true
+nisshi-storage.workspace = true
+nisshi-storage-dynostore.workspace = true
+rama.workspace = true
+tokio = { workspace = true, features = ["net"] }
+url.workspace = true
+uuid.workspace = true
+
+[build-dependencies]
+cc = "1.2"

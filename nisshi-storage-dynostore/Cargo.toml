@@ -46,3 +46,11 @@ tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+object_store = { workspace = true, features = ["default", "aws", "gcp"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+rama = { workspace = true, features = ["default", "http", "tcp"] }
+tokio-util = { workspace = true, features = ["full"] }

@@ -23,6 +23,7 @@ members = [
     "nisshi-storage-slatedb",
     "nisshi-storage-sql",
     "nisshi-topic",
+    "nisshi-wasi",
 ]
 
 [workspace.package]
@@ -118,7 +119,7 @@ iceberg-catalog-rest = "0.10.1"
 iceberg-datafusion = "0.10.1"
 iceberg-storage-opendal = { version = "0.10.1", default-features = false, features = ["opendal-s3", "opendal-fs", "opendal-memory"] }
 indicatif = "0.18.3"
-jsonschema = "0.59.0"
+jsonschema = { version = "0.59.0", default-features = false }
 lazy_static = "1.4.0"
 libc = "0.2.189"
 libfuzzer-sys = "0.4"
@@ -127,7 +128,7 @@ lz4 = "1.28.1"
 nanoid = "0.5.0"
 nonzero_ext = "0.3.0"
 num-bigint = "0.4"
-object_store = { version = "0.14.1", features = ["aws", "gcp"] }
+object_store = { version = "0.14.1", default-features = false }
 opentelemetry = "0.33.0"
 opentelemetry-otlp = "0.33.0"
 opentelemetry-semantic-conventions = "0.33.0"
@@ -148,14 +149,14 @@ protobuf = { version = "3.7.1", features = ["with-bytes"] }
 protobuf-json-mapping = "3.7.1"
 protobuf-parse = "3.7.1"
 quote = "1.0"
-rama = { version = "0.4.0", features = ["http", "tcp"] }
+rama = { version = "0.4.0", default-features = false }
 rand = "0.10"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 regex = "1.12.3"
 rhai = { version = "1.24.0", features = ["sync"] }
 rhai-rand = "0.2"
 rsasl = { version = "2.2.0", features = ["config_builder", "provider", "oauthbearer", "scram-sha-2"], default-features = false }
-rustls = "0.23.27"
+rustls = { version = "0.23.27", default-features = false, features = ["std"] }
 rustls-native-certs = "0.8.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
@@ -188,11 +189,11 @@ temp-env = "0.3"
 tempfile = "3"
 thiserror = "2.0"
 time = { version = "0.3.47", features = ["formatting", "macros", "parsing"] }
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { version = "1", features = ["sync", "macros", "io-util", "rt", "time"] }
 tokio-postgres = { version = "0.7.13", features = ["with-serde_json-1","with-uuid-1",] }
 tokio-postgres-rustls = "0.14.0"
 tokio-rustls = "0.26.4"
-tokio-util = { version = "0.7", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "rt", "time"] }
 traceforge = "0.2"
 tracing = "0.1"
 tracing-core = { version = "0.1" }

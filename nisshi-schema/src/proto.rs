@@ -16,7 +16,6 @@
 
 use std::{
     collections::BTreeMap,
-    io::Write,
     ops::{Deref, RangeInclusive},
     sync::LazyLock,
 };
@@ -29,18 +28,23 @@ use fake::Fake;
 use nisshi_sans_io::{ErrorCode, record::inflated::Batch};
 use protobuf::{
     CodedInputStream, MessageDyn, UnknownValueRef,
-    descriptor::{self, FieldDescriptorProto},
+    descriptor::FieldDescriptorProto,
     reflect::{
         EnumDescriptor, FileDescriptor, MessageDescriptor, ReflectValueBox, ReflectValueRef,
         RuntimeFieldType, RuntimeType,
     },
-    well_known_types,
 };
+#[cfg(not(target_family = "wasm"))]
+use protobuf::{descriptor, well_known_types};
+#[cfg(not(target_family = "wasm"))]
+use std::io::Write;
+
 use protobuf_json_mapping::{parse_dyn_from_str, print_to_string};
 use rand::prelude::*;
 use rhai::{Engine, packages::Package};
 use rhai_rand::RandomPackage;
 use serde_json::{Map, Value};
+#[cfg(not(target_family = "wasm"))]
 use tempfile::{NamedTempFile, tempdir};
 use tracing::{debug, error};
 
@@ -744,6 +748,7 @@ impl TryFrom<Bytes> for Schema {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 static WELL_KNOWN_TYPES: LazyLock<Vec<FileDescriptor>> = LazyLock::new(|| {
     vec![
         descriptor::file_descriptor().to_owned(),
@@ -758,6 +763,7 @@ static WELL_KNOWN_TYPES: LazyLock<Vec<FileDescriptor>> = LazyLock::new(|| {
 static META_FILE_DESCRIPTOR: LazyLock<Option<Vec<FileDescriptor>>> =
     LazyLock::new(|| make_fd(Bytes::from_static(include_bytes!("meta.proto"))).ok());
 
+#[cfg(not(target_family = "wasm"))]
 fn make_fd(proto: Bytes) -> Result<Vec<FileDescriptor>> {
     tempdir().map_err(Into::into).and_then(|temp_dir| {
         NamedTempFile::new_in(&temp_dir)
@@ -1348,4 +1354,11 @@ mod tests {
 
         Ok(())
     }
+}
+
+#[cfg(target_family = "wasm")]
+fn make_fd(_proto: Bytes) -> Result<Vec<FileDescriptor>> {
+    Err(Error::Message(
+        "Protocol Buffer schema compilation is unavailable in the WASI proof".into(),
+    ))
 }

@@ -28,7 +28,17 @@ use nisshi_sans_io::{
 use opentelemetry::KeyValue;
 use rama::{Layer, Service, extensions::Extensions, matcher::Matcher, service::BoxService};
 use rsasl::config::SASLConfig;
+#[cfg(not(target_family = "wasm"))]
 use tokio::task::spawn_blocking;
+
+// WASI p2 executes on one thread, so codecs run inline instead of spawning a thread.
+#[cfg(target_family = "wasm")]
+async fn spawn_blocking<F, T>(function: F) -> Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T,
+{
+    Ok(function())
+}
 use tracing::{debug, error, instrument};
 
 use crate::{API_ERRORS, API_REQUESTS, ProgressBarExtension};

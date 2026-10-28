@@ -14,30 +14,39 @@
 
 use std::{
     fmt::{self, Display, Formatter},
-    num::NonZeroU32,
-    str::FromStr as _,
     sync::Arc,
-    time::Duration,
 };
 
+#[cfg(not(target_family = "wasm"))]
+use std::{num::NonZeroU32, str::FromStr as _, time::Duration};
+
 use async_trait::async_trait;
+#[cfg(not(target_family = "wasm"))]
 use nisshi_schema::redact_url;
+#[cfg(not(target_family = "wasm"))]
+use nisshi_storage::ProduceRequestBatcher;
 use nisshi_storage::{
-    ArcDynStorage, ProduceRequestBatcher, Result, StorageCapabilities, StorageFactory,
-    StorageFactoryConfiguration, reject_unrecognized_options,
+    ArcDynStorage, Result, StorageCapabilities, StorageFactory, StorageFactoryConfiguration,
+    reject_unrecognized_options,
 };
+use object_store::memory::InMemory;
+#[cfg(not(target_family = "wasm"))]
 use object_store::{
     aws::{AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut},
     gcp::GoogleCloudStorageBuilder,
-    memory::InMemory,
 };
 use regex::Regex;
+#[cfg(not(target_family = "wasm"))]
 use tracing::{debug, warn};
 
-use crate::{dynostore::DynoStore, gcs::limit::PutRateLimiter};
+use crate::dynostore::DynoStore;
+#[cfg(not(target_family = "wasm"))]
+use crate::gcs::limit::PutRateLimiter;
 
 const MEMORY: &str = "in-memory (memory://)";
+#[cfg(not(target_family = "wasm"))]
 const S3: &str = "S3 (s3://)";
+#[cfg(not(target_family = "wasm"))]
 const GCS: &str = "Google Cloud Storage (gs://)";
 
 #[derive(Clone, Copy, Debug)]
@@ -77,9 +86,11 @@ impl StorageFactory for MemoryEngineFactory {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy, Debug)]
 pub struct S3OptimisticConcurrencyEngineFactory;
 
+#[cfg(not(target_family = "wasm"))]
 impl Display for S3OptimisticConcurrencyEngineFactory {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(S3)
@@ -87,6 +98,7 @@ impl Display for S3OptimisticConcurrencyEngineFactory {
 }
 
 #[async_trait]
+#[cfg(not(target_family = "wasm"))]
 impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"s3").map_err(Into::into)
@@ -186,6 +198,7 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
 /// that this function must keep matching: `1`, `true`, `on`, `yes` and `y`
 /// in any case are true. Every other value is either false or rejected by
 /// `build()` before the credential check runs.
+#[cfg(not(target_family = "wasm"))]
 fn skip_signature(value: &str) -> bool {
     matches!(
         value.to_ascii_lowercase().as_str(),
@@ -193,9 +206,11 @@ fn skip_signature(value: &str) -> bool {
     )
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy, Debug)]
 pub struct GoogleCloudStorageEngineFactory;
 
+#[cfg(not(target_family = "wasm"))]
 impl Display for GoogleCloudStorageEngineFactory {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(GCS)
@@ -203,6 +218,7 @@ impl Display for GoogleCloudStorageEngineFactory {
 }
 
 #[async_trait]
+#[cfg(not(target_family = "wasm"))]
 impl StorageFactory for GoogleCloudStorageEngineFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"gs").map_err(Into::into)

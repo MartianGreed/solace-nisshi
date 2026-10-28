@@ -46,7 +46,6 @@ opentelemetry.workspace = true
 ordered-float.workspace = true
 parquet = { workspace = true, optional = true }
 protobuf-json-mapping.workspace = true
-protobuf-parse.workspace = true
 protobuf.workspace = true
 rand.workspace = true
 regex.workspace = true
@@ -55,7 +54,6 @@ rhai.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 nisshi-sans-io.workspace = true
-tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
@@ -70,3 +68,10 @@ rand.workspace = true
 [[test]]
 name = "berg"
 required-features = ["iceberg"]
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+object_store = { workspace = true, features = ["default", "aws", "gcp"] }
+jsonschema = { workspace = true, features = ["default"] }
+protobuf-parse.workspace = true
+tempfile.workspace = true

@@ -42,3 +42,6 @@ parquet = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:niss
 postgres = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-broker/postgres", "nisshi-cli/postgres", "nisshi-storage/postgres"]
 slatedb = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-broker/slatedb", "nisshi-cli/slatedb", "nisshi-storage/slatedb"]
 turso = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-broker/turso", "nisshi-cli/turso", "nisshi-storage/turso"]
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

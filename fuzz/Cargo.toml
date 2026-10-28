@@ -227,3 +227,7 @@ doc = false
 bench = false
 
 [lints]
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rama = { workspace = true, features = ["default", "http", "tcp"] }
+tokio = { workspace = true, features = ["full", "test-util"] }

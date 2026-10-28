@@ -38,14 +38,10 @@ glob.workspace = true
 http-body-util.workspace = true
 human-units.workspace = true
 humantime.workspace = true
-hyper-util.workspace = true
-hyper.workspace = true
 indicatif.workspace = true
 jsonschema.workspace = true
-libc.workspace = true
 nisshi-auth.workspace = true
 nisshi-model.workspace = true
-nisshi-otel.workspace = true
 nisshi-sans-io.workspace = true
 nisshi-schema.workspace = true
 nisshi-service.workspace = true
@@ -56,7 +52,6 @@ nisshi-storage-sql = { workspace = true, optional = true }
 nisshi-storage.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
-opentelemetry_sdk.workspace = true
 rama.workspace = true
 rand.workspace = true
 regex.workspace = true
@@ -64,12 +59,9 @@ rsasl.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-socket2.workspace = true
 thiserror.workspace = true
-tokio-rustls.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true
-tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
 url.workspace = true
@@ -90,3 +82,22 @@ nisshi-storage.workspace = true
 crc-fast.workspace = true
 nisshi-storage-dynostore = { workspace = true, features = ["test-support"] }
 traceforge.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rama = { workspace = true, features = ["default", "http", "tcp"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-util = { workspace = true, features = ["full"] }
+jsonschema = { workspace = true, features = ["default"] }
+rustls = { workspace = true, features = ["default"] }
+
+nisshi-otel.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+socket2.workspace = true
+libc.workspace = true
+tokio-rustls.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+object_store = { workspace = true, features = ["default", "aws", "gcp"] }

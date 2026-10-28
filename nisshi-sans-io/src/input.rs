@@ -18,10 +18,10 @@ use std::sync::{
 };
 
 use bytes::Bytes;
-use rama::{
-    ServiceInput,
-    extensions::{Extension, Extensions, ExtensionsRef},
-};
+use rama::extensions::{Extension, Extensions, ExtensionsRef};
+
+#[cfg(not(target_family = "wasm"))]
+use rama::ServiceInput;
 
 use crate::{Body, Frame, Request};
 
@@ -52,6 +52,7 @@ impl From<Frame> for FrameInput {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<ServiceInput<Frame>> for FrameInput {
     fn from(value: ServiceInput<Frame>) -> Self {
         Self {
@@ -82,6 +83,7 @@ impl From<Body> for BodyInput {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<ServiceInput<Body>> for BodyInput {
     fn from(value: ServiceInput<Body>) -> Self {
         Self {
@@ -118,6 +120,7 @@ where
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl<Q> From<ServiceInput<Q>> for RequestInput<Q>
 where
     Q: Request,
@@ -151,6 +154,7 @@ impl From<Bytes> for BytesInput {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<ServiceInput<Bytes>> for BytesInput {
     fn from(value: ServiceInput<Bytes>) -> Self {
         Self {

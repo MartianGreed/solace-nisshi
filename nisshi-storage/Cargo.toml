@@ -52,7 +52,6 @@ rama.workspace = true
 rand.workspace = true
 regex.workspace = true
 rsasl.workspace = true
-rustls-native-certs.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -80,3 +79,11 @@ opentelemetry_sdk.workspace = true
 tempfile.workspace = true
 time.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rama = { workspace = true, features = ["default", "http", "tcp"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-util = { workspace = true, features = ["full"] }
+object_store = { workspace = true, optional = true, features = ["default", "aws", "gcp"] }
+rustls = { workspace = true, features = ["default"] }
+rustls-native-certs.workspace = true

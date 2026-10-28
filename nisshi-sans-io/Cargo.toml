@@ -77,3 +77,6 @@ diagnostics = []
 [[bench]]
 name = "decode_bench"
 harness = false
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rama = { workspace = true, features = ["default", "http", "tcp"] }
