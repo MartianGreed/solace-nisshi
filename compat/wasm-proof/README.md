@@ -34,6 +34,7 @@ The client checks:
 - Topic creation and the duplicate-topic error.
 - Two partitions, with two successive producer connections and a new consumer.
 - Exact keys, binary values, headers and offsets for 12 records per codec.
+- Exact log start/end offsets for both partitions after each producer round.
 - Uncompressed, Gzip, Snappy, LZ4 and Zstandard batches.
 - Actual producer batch codecs, so client compression fallback cannot pass a
   compressed case using uncompressed data.

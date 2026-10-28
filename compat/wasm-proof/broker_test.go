@@ -48,6 +48,42 @@ func client(t *testing.T, options ...kgo.Opt) *kgo.Client {
 	return cl
 }
 
+func checkLogOffsets(t *testing.T, ctx context.Context, cl *kgo.Client, topic string, end int64) {
+	t.Helper()
+	for _, check := range []struct {
+		timestamp int64
+		want      int64
+	}{{-2, 0}, {-1, end}} {
+		request := kmsg.NewPtrListOffsetsRequest()
+		requestedTopic := kmsg.NewListOffsetsRequestTopic()
+		requestedTopic.Topic = topic
+		for partition := int32(0); partition < 2; partition++ {
+			requestedPartition := kmsg.NewListOffsetsRequestTopicPartition()
+			requestedPartition.Partition = partition
+			requestedPartition.Timestamp = check.timestamp
+			requestedTopic.Partitions = append(requestedTopic.Partitions, requestedPartition)
+		}
+		request.Topics = []kmsg.ListOffsetsRequestTopic{requestedTopic}
+		response, err := request.RequestWith(ctx, cl)
+		if err != nil {
+			t.Fatalf("list offsets for timestamp %d: %v", check.timestamp, err)
+		}
+		if response == nil || len(response.Topics) != 1 || response.Topics[0].Topic != topic || len(response.Topics[0].Partitions) != 2 {
+			t.Fatalf("list offsets response: %+v", response)
+		}
+		seen := make(map[int32]bool)
+		for _, partition := range response.Topics[0].Partitions {
+			if partition.Partition < 0 || partition.Partition >= 2 || seen[partition.Partition] {
+				t.Fatalf("unexpected or duplicate list offsets partition: %+v", partition)
+			}
+			seen[partition.Partition] = true
+			if partition.ErrorCode != 0 || partition.Offset != check.want {
+				t.Fatalf("partition %d timestamp %d: offset=%d error=%d; want offset=%d error=0", partition.Partition, check.timestamp, partition.Offset, partition.ErrorCode, check.want)
+			}
+		}
+	}
+}
+
 func TestKeyedRecordsSurviveConnections(t *testing.T) {
 	codecs := []struct {
 		name  string
@@ -120,6 +156,7 @@ func TestKeyedRecordsSurviveConnections(t *testing.T) {
 						t.Fatalf("produce partition %d offset %d; want %d", record.Partition, record.Offset, expected)
 					}
 				}
+				checkLogOffsets(t, ctx, producer, topic, int64((round+1)*3))
 			}
 			produce(0)
 			produce(1)
@@ -160,7 +197,7 @@ func TestKeyedRecordsSurviveConnections(t *testing.T) {
 			if next[0] != 6 || next[1] != 6 {
 				t.Fatalf("partition counts: %v", next)
 			}
-			t.Logf("%s: topic created; 12 exact keyed records, headers and offsets across two partitions and separate producers/consumer", codec.name)
+			t.Logf("%s: topic created; 12 exact keyed records, headers, record offsets and log start/end offsets across two partitions and separate producers/consumer", codec.name)
 		})
 	}
 }
