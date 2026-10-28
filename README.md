@@ -1,7 +1,7 @@
 <div align="center">
 
-# Nisshi (née Tansu) 🗃️
-stateless Apache Kafka®-compatible broker with pluggable storage (PostgreSQL, SQLite, S3, memory)
+# Nisshi 🗃️
+A stateless server that implements the Apache Kafka® API, with pluggable storage (PostgreSQL, SQLite, S3, memory)
 
 <br>
 
@@ -25,14 +25,14 @@ stateless Apache Kafka®-compatible broker with pluggable storage (PostgreSQL, S
 
 # What is Nisshi?
 
-[Nisshi][github-com-nisshi-io] (née Tansu) is an Apache Kafka®-compatible broker
+[Nisshi][github-com-nisshi-io] implements the Apache Kafka® API,
 with PostgreSQL, libSQL (SQLite), S3 or memory storage engines.
 Schema backed topics (Avro, JSON or Protocol buffers) can
 be written as [Apache Iceberg](https://iceberg.apache.org) or [Delta Lake](https://delta.io) tables.
 
 Features:
 
-- Apache Kafka®-compatible
+- Implements the Apache Kafka® API
 - Available with [PostgreSQL](https://www.postgresql.org), [libSQL](https://docs.turso.tech/libsql), [S3](https://en.wikipedia.org/wiki/Amazon_S3) or memory storage engines
 - Topics [validated](docs/schema-registry.md) by [JSON Schema][json-schema-org], [Apache Avro](https://avro.apache.org)
   or [Protocol buffers](protocol-buffers) can be written as [Apache Iceberg](https://iceberg.apache.org) or [Delta Lake](https://delta.io) tables
@@ -82,6 +82,8 @@ To learn more about Nisshi, see the full documentation at [docs.nisshi.io](https
 Use the [latest release][nisshi-latest-release], the one marked **Latest** on the Releases page. `cargo install nisshi` and the `latest` container image both skip pre-releases.
 
 Releases marked **Pre-release**, with tags such as `v0.8.0-pre.1`, are builds of `main` published ahead of the next release. Their behaviour and storage formats can still change, and a later version may not read the data they wrote (upgrading from 0.7.0-pre.1 or pre.2 to 0.7.0 needs the manual steps in the 0.7.0 upgrade notes). Use them for testing, not for data you want to keep. To install one, name its exact version, for example `ghcr.io/nisshi-io/nisshi:0.8.0-pre.1`.
+
+Upgrading? Read the upgrade notes in [CHANGELOG.md](CHANGELOG.md) for every release after the one you run. The default cluster id and the Iceberg and Delta namespace changed in 0.7.0, and the topic configuration keys changed in 0.8.0.
 
 This README describes `main`, which can be ahead of the latest release. To read the README of a release, open it at its tag, for example [v0.7.0](https://github.com/nisshi-io/solace-nisshi/blob/v0.7.0/README.md).
 
@@ -199,7 +201,7 @@ Choose the engine with `--storage-engine` (or `STORAGE_ENGINE`) using the URL sc
 | PostgreSQL | `postgres://` | `postgres` | Suitable for production. Tested, with bugs and security issues fixed. Help comes from the community. |
 | S3 and Google Cloud Storage | `s3://`, `gs://` | `dynostore` | Experimental. Available for continuity. Not recommended for production. |
 | SQLite (libSQL) | `sqlite://` | `libsql` | Suitable for development. |
-| In-memory | `memory://` | `dynostore` | Suitable for development and testing. Data is lost when the broker stops. |
+| In-memory | `memory://` | `dynostore` | Suitable for development and testing. Data is lost when Nisshi stops. |
 | Turso | `turso://` | `turso` | Experimental. |
 | SlateDB | `slatedb://` | `slatedb` | Deprecated. Not recommended for new deployments, because it allows a single writer. Only security fixes are accepted. The engine may be removed in a future release. Use PostgreSQL for production, or SQLite or in-memory for development. The broker logs a warning at startup. |
 
