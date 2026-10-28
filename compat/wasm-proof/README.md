@@ -35,6 +35,8 @@ The client checks:
 - Two partitions, with two successive producer connections and a new consumer.
 - Exact keys, binary values, headers and offsets for 12 records per codec.
 - Uncompressed, Gzip, Snappy, LZ4 and Zstandard batches.
+- Actual producer batch codecs, so client compression fallback cannot pass a
+  compressed case using uncompressed data.
 - Rejection of negative, empty and oversized frame lengths, followed by a
   successful client request on a new connection.
 

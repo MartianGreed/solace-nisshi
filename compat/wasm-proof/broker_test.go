@@ -16,6 +16,12 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
+type batchCodecProof chan kgo.ProduceBatchMetrics
+
+func (proof batchCodecProof) OnProduceBatchWritten(_ kgo.BrokerMetadata, _ string, _ int32, metrics kgo.ProduceBatchMetrics) {
+	proof <- metrics
+}
+
 func brokerAddress(t *testing.T) string {
 	t.Helper()
 	address := os.Getenv("BOOTSTRAP_SERVERS")
@@ -46,10 +52,11 @@ func TestKeyedRecordsSurviveConnections(t *testing.T) {
 	codecs := []struct {
 		name  string
 		codec kgo.CompressionCodec
+		id    uint8
 	}{
-		{"none", kgo.NoCompression()}, {"gzip", kgo.GzipCompression()},
-		{"snappy", kgo.SnappyCompression()}, {"lz4", kgo.Lz4Compression()},
-		{"zstd", kgo.ZstdCompression()},
+		{"none", kgo.NoCompression(), 0}, {"gzip", kgo.GzipCompression(), 1},
+		{"snappy", kgo.SnappyCompression(), 2}, {"lz4", kgo.Lz4Compression(), 3},
+		{"zstd", kgo.ZstdCompression(), 4},
 	}
 	for _, codec := range codecs {
 		t.Run(codec.name, func(t *testing.T) {
@@ -77,7 +84,8 @@ func TestKeyedRecordsSurviveConnections(t *testing.T) {
 			admin.Close()
 
 			produce := func(round int) {
-				producer := client(t, kgo.RecordPartitioner(kgo.ManualPartitioner()), kgo.ProducerBatchCompression(codec.codec))
+				proof := make(batchCodecProof, 6)
+				producer := client(t, kgo.RecordPartitioner(kgo.ManualPartitioner()), kgo.ProducerBatchCompression(codec.codec), kgo.WithHooks(proof))
 				defer producer.Close()
 				var records []*kgo.Record
 				for partition := int32(0); partition < 2; partition++ {
@@ -86,7 +94,7 @@ func TestKeyedRecordsSurviveConnections(t *testing.T) {
 						records = append(records, &kgo.Record{
 							Topic: topic, Partition: partition,
 							Key:     []byte(fmt.Sprintf("key-%d-%d", partition, offset)),
-							Value:   []byte(fmt.Sprintf("payload-λ-%d-%d\x00", partition, offset)),
+							Value:   bytes.Repeat([]byte(fmt.Sprintf("payload-λ-%d-%d\x00", partition, offset)), 32),
 							Headers: []kgo.RecordHeader{{Key: "proof", Value: []byte(codec.name)}},
 						})
 					}
@@ -94,6 +102,17 @@ func TestKeyedRecordsSurviveConnections(t *testing.T) {
 				results := producer.ProduceSync(ctx, records...)
 				if err := results.FirstErr(); err != nil {
 					t.Fatal(err)
+				}
+				for written := 0; written < len(records); {
+					select {
+					case metrics := <-proof:
+						if metrics.CompressionType != codec.id {
+							t.Fatalf("written batch codec = %d; want %d", metrics.CompressionType, codec.id)
+						}
+						written += metrics.NumRecords
+					case <-ctx.Done():
+						t.Fatalf("waiting for batch codec evidence: %v", ctx.Err())
+					}
 				}
 				for index, record := range records {
 					expected := int64(round*3 + index%3)
@@ -124,7 +143,7 @@ func TestKeyedRecordsSurviveConnections(t *testing.T) {
 						t.Fatalf("record topic=%q partition=%d offset=%d; want %q offset=%d", record.Topic, record.Partition, record.Offset, topic, expectedOffset)
 					}
 					expectedKey := []byte(fmt.Sprintf("key-%d-%d", record.Partition, expectedOffset))
-					expectedValue := []byte(fmt.Sprintf("payload-λ-%d-%d\x00", record.Partition, expectedOffset))
+					expectedValue := bytes.Repeat([]byte(fmt.Sprintf("payload-λ-%d-%d\x00", record.Partition, expectedOffset)), 32)
 					if !bytes.Equal(record.Key, expectedKey) || !bytes.Equal(record.Value, expectedValue) {
 						t.Fatalf("record %d/%d key=%q value=%q", record.Partition, record.Offset, record.Key, record.Value)
 					}
