@@ -5,6 +5,7 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 : "${WASI_SDK_PATH:?Set WASI_SDK_PATH to an extracted WASI SDK 34 directory}"
 address=${WASI_BROKER_ADDRESS:-127.0.0.1:19092}
+mkdir -p "$root/target"
 run_directory=$(mktemp -d "$root/target/wasm-proof.XXXXXX")
 broker_pid=
 cleanup() {
