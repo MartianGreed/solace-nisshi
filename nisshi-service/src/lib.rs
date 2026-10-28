@@ -230,22 +230,28 @@
 
 use std::{
     fmt, io,
-    net::SocketAddr,
     ops::{Range, RangeInclusive},
     sync::{Arc, LazyLock, Mutex, PoisonError},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
+
+#[cfg(not(target_family = "wasm"))]
+use opentelemetry::{KeyValue, metrics::Histogram};
+#[cfg(not(target_family = "wasm"))]
+use std::{net::SocketAddr, time::SystemTime};
 
 use indicatif::ProgressBar;
 use nisshi_sans_io::{Body, Frame};
 use opentelemetry::{
-    InstrumentationScope, KeyValue, global,
-    metrics::{Counter, Histogram, Meter},
+    InstrumentationScope, global,
+    metrics::{Counter, Meter},
 };
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 use rama::{Layer, Service, extensions::Extension};
 use rand::{prelude::*, rngs::SmallRng};
-use tokio::{net::lookup_host, sync::oneshot, task::JoinError, time::sleep};
+#[cfg(not(target_family = "wasm"))]
+use tokio::net::lookup_host;
+use tokio::{sync::oneshot, task::JoinError, time::sleep};
 use tracing::{debug, instrument};
 use url::Url;
 
@@ -253,7 +259,9 @@ mod api;
 mod channel;
 mod consumer;
 mod frame;
+#[cfg(not(target_family = "wasm"))]
 mod input;
+#[cfg(not(target_family = "wasm"))]
 mod stream;
 mod version_gate;
 
@@ -263,6 +271,7 @@ pub use version_gate::{
     CAPPED_API_VERSIONS, VersionGateLayer, VersionGateService, capped_range, routable_max_version,
 };
 
+#[cfg(not(target_family = "wasm"))]
 pub use input::TcpListenerInput;
 
 pub use channel::{
@@ -278,6 +287,7 @@ pub use frame::{
     RequestApiKeyMatcher, RequestFrameLayer, RequestFrameService, RequestLayer, ResponseService,
 };
 
+#[cfg(not(target_family = "wasm"))]
 pub use stream::{
     BytesLayer, BytesService, BytesTcpService, DEFAULT_CONNECTION_IDLE_TIMEOUT,
     DEFAULT_IO_IDLE_TIMEOUT, DEFAULT_MAXIMUM_FRAME_SIZE,
@@ -422,6 +432,7 @@ pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
 /// # Ok(())
 /// # }
 /// ```
+#[cfg(not(target_family = "wasm"))]
 pub async fn host_port(url: Url) -> Result<SocketAddr, Error> {
     if let Some(host) = url.host_str()
         && let Some(port) = url.port()
@@ -449,6 +460,7 @@ pub async fn host_port(url: Url) -> Result<SocketAddr, Error> {
     Err(Error::UnknownHost(url))
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) static DNS_LOOKUP_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     METER
         .u64_histogram("dns_lookup_duration")
@@ -457,6 +469,7 @@ pub(crate) static DNS_LOOKUP_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(
         .build()
 });
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) static REQUEST_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     METER
         .u64_histogram("nisshi_request_size")
@@ -465,6 +478,7 @@ pub(crate) static REQUEST_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
         .build()
 });
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) static RESPONSE_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     METER
         .u64_histogram("nisshi_response_size")
@@ -473,6 +487,7 @@ pub(crate) static RESPONSE_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
         .build()
 });
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) static REQUEST_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     METER
         .u64_histogram("nisshi_request_duration")
@@ -495,6 +510,7 @@ pub(crate) static API_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) static BYTES_SENT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_bytes_sent")
@@ -502,6 +518,7 @@ pub(crate) static BYTES_SENT: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) static FRAMES_REJECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_frames_rejected")
@@ -511,6 +528,7 @@ pub(crate) static FRAMES_REJECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) static BYTES_RECEIVED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_bytes_received")

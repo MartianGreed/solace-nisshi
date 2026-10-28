@@ -6426,6 +6426,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nisshi-wasi"
+version = "0.8.1"
+dependencies = [
+ "bytes",
+ "cc",
+ "nisshi-broker",
+ "nisshi-sans-io",
+ "nisshi-service",
+ "nisshi-storage",
+ "nisshi-storage-dynostore",
+ "rama",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

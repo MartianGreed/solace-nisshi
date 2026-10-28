@@ -38,3 +38,8 @@ tracing-subscriber.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rama = { workspace = true, features = ["default", "http", "tcp"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-util = { workspace = true, features = ["full"] }

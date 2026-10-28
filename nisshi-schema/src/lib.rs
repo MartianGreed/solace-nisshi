@@ -20,7 +20,6 @@
 
 use std::{
     collections::BTreeMap,
-    env::{self},
     fmt::{self, Display, Formatter},
     io,
     num::TryFromIntError,
@@ -33,6 +32,9 @@ use std::{
 
 #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
 use arrow::{datatypes::DataType, error::ArrowError, record_batch::RecordBatch};
+
+#[cfg(not(target_family = "wasm"))]
+use std::env;
 
 use bytes::Bytes;
 
@@ -48,10 +50,10 @@ use governor::InsufficientCapacity;
 use iceberg::spec::DataFileBuilderError;
 
 use jsonschema::ValidationError;
-use object_store::{
-    DynObjectStore, ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, local::LocalFileSystem,
-    memory::InMemory, path::Path,
-};
+use object_store::{DynObjectStore, ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
+#[cfg(not(target_family = "wasm"))]
+use object_store::{aws::AmazonS3Builder, local::LocalFileSystem};
+
 use opentelemetry::{
     InstrumentationScope, KeyValue, global,
     metrics::{Counter, Histogram, Meter},
@@ -431,6 +433,7 @@ impl TryFrom<&Url> for Builder {
         debug!(storage = %redact_url(storage));
 
         match storage.scheme() {
+            #[cfg(not(target_family = "wasm"))]
             "s3" => {
                 let bucket_name = storage.host_str().unwrap_or("schema");
 
@@ -441,6 +444,7 @@ impl TryFrom<&Url> for Builder {
                     .map(Self::new)
             }
 
+            #[cfg(not(target_family = "wasm"))]
             "file" => {
                 let mut path = env::current_dir().inspect(|current_dir| debug!(?current_dir))?;
 

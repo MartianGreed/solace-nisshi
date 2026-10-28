@@ -15,11 +15,9 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod dynostore;
 mod factory;
+#[cfg(not(target_family = "wasm"))]
 mod gcs;
 
-pub use {
-    dynostore::DynoStore,
-    factory::{
-        GoogleCloudStorageEngineFactory, MemoryEngineFactory, S3OptimisticConcurrencyEngineFactory,
-    },
-};
+#[cfg(not(target_family = "wasm"))]
+pub use factory::{GoogleCloudStorageEngineFactory, S3OptimisticConcurrencyEngineFactory};
+pub use {dynostore::DynoStore, factory::MemoryEngineFactory};

@@ -90,7 +90,7 @@ where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    if Handle::try_current().is_err() {
+    if cfg!(target_family = "wasm") || Handle::try_current().is_err() {
         return f();
     }
 

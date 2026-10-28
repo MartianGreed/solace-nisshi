@@ -35,8 +35,14 @@ use thiserror::Error;
 use tokio::{sync::broadcast::error::SendError, task::JoinError};
 use tracing_subscriber::filter::ParseError;
 
+#[cfg(not(target_family = "wasm"))]
 pub mod broker;
+#[cfg(target_family = "wasm")]
+pub mod broker {
+    pub mod group;
+}
 pub mod coordinator;
+#[cfg(not(target_family = "wasm"))]
 pub mod otel;
 pub mod service;
 
@@ -77,6 +83,7 @@ pub enum Error {
     EmptyJoinGroupRequestProtocol,
     ExpectedJoinGroupRequestProtocol(&'static str),
 
+    #[cfg(not(target_family = "wasm"))]
     Hyper(Arc<hyper::http::Error>),
 
     /// A sweep interval option in the storage URL has a value that the broker
@@ -99,6 +106,7 @@ pub enum Error {
     Message(String),
     Model(#[from] nisshi_model::Error),
 
+    #[cfg(not(target_family = "wasm"))]
     Otel(#[from] nisshi_otel::Error),
 
     ParseFilter(Arc<ParseError>),
@@ -138,6 +146,7 @@ impl From<SendError<CancelKind>> for Error {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<hyper::http::Error> for Error {
     fn from(value: hyper::http::Error) -> Self {
         Self::Hyper(Arc::new(value))
